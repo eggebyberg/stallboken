@@ -692,10 +692,15 @@
       renderFeedAdmin();
     }
     function renderFeedAdmin(){
-      $("fa-slots").innerHTML = fa.slots.map(x => `<li data-slot="${esc(x.id)}">
+      $("fa-slots").innerHTML = fa.slots.map((x, i) => `<li data-slot="${esc(x.id)}">
           <div class="field"><label for="fs-n-${esc(x.id)}">Namn</label><input id="fs-n-${esc(x.id)}" data-k="name" maxlength="40" value="${esc(x.name)}"></div>
           <div class="field"><label for="fs-h-${esc(x.id)}">Tid</label><input id="fs-h-${esc(x.id)}" data-k="hint" maxlength="40" value="${esc(x.hint || "")}" placeholder="t.ex. ca 06–08"></div>
-          <button class="btn small" type="button" data-fsdel="${esc(x.id)}">Ta bort</button></li>`).join("")
+          <div class="fsacts">
+            <button class="btn primary small" type="button" data-fssave="${esc(x.id)}" disabled>Spara</button>
+            <button class="btn small" type="button" data-fsmove="-1" data-id="${esc(x.id)}" aria-label="Flytta upp ${esc(x.name)}"${i === 0 ? " disabled" : ""}>↑</button>
+            <button class="btn small" type="button" data-fsmove="1" data-id="${esc(x.id)}" aria-label="Flytta ner ${esc(x.name)}"${i === fa.slots.length - 1 ? " disabled" : ""}>↓</button>
+            <button class="btn small" type="button" data-fsdel="${esc(x.id)}">Ta bort</button>
+          </div></li>`).join("")
         || '<li class="hint">Inga fodringspass. Lägg till ett nedan.</li>';
       if(!fa.horses.length){ $("fa-horses").innerHTML = '<p class="hint">Inga hästar än. Lägg till hästar via knappen Hästar.</p>'; return; }
       $("fa-horses").innerHTML = fa.horses.map(h => `<div class="fahorse" data-horse="${h.id}">
@@ -705,16 +710,40 @@
           <div class="fasave"><button class="btn primary small" type="button" data-fsave="${h.id}">Spara ${esc(h.name)}</button><span class="hint" data-saved="${h.id}"></span></div>
         </div>`).join("");
     }
-    /* pass: spara när man lämnar fältet */
-    $("fa-slots").addEventListener("change", async e => {
-      const inp = e.target.closest("input[data-k]"); if(!inp) return;
-      const li = inp.closest("li[data-slot]"); const id = li.dataset.slot;
+    /* pass: Spara-knappen tänds när något ändrats */
+    $("fa-slots").addEventListener("input", e => {
+      const li = e.target.closest("li[data-slot]"); if(!li) return;
+      const x = fa.slots.find(z => z.id === li.dataset.slot); if(!x) return;
+      const dirty = li.querySelector('[data-k="name"]').value.trim() !== x.name || li.querySelector('[data-k="hint"]').value.trim() !== (x.hint || "");
+      const btn = li.querySelector("[data-fssave]"); btn.disabled = !dirty; btn.textContent = "Spara";
+    });
+    $("fa-slots").addEventListener("keydown", e => {
+      if(e.key === "Enter" && e.target.matches("input[data-k]")){ e.preventDefault(); const b = e.target.closest("li").querySelector("[data-fssave]"); if(!b.disabled) b.click(); }
+    });
+    async function saveSlot(id, btn){
+      const li = btn.closest("li[data-slot]");
       const name = li.querySelector('[data-k="name"]').value.trim(), hint = li.querySelector('[data-k="hint"]').value.trim();
       if(!name) return admErr("Passet behöver ett namn.");
+      btn.disabled = true; btn.textContent = "Sparar…";
       const r = await sb.from("feed_slots").update({name, hint}).eq("id", id);
-      if(r.error) return admErr("Det gick inte att spara passet.");
-      admErr(""); toast("Passet är sparat");
-    });
+      if(r.error){ btn.disabled = false; btn.textContent = "Spara"; return admErr("Det gick inte att spara passet."); }
+      const x = fa.slots.find(z => z.id === id); if(x){ x.name = name; x.hint = hint; }
+      admErr(""); btn.textContent = "Sparat ✓"; toast("Passet är sparat");
+      renderFeedHorsesOnly();
+    }
+    function renderFeedHorsesOnly(){
+      /* uppdatera passnamnen i hästkorten utan att tappa det som skrivits */
+      fa.slots.forEach(x => document.querySelectorAll(`#fa-horses textarea[data-slot="${CSS.escape(x.id)}"]`).forEach(t => { const l = t.previousElementSibling; if(l) l.textContent = x.name; }));
+    }
+    async function moveSlot(id, dir){
+      const i = fa.slots.findIndex(z => z.id === id), j = i + dir;
+      if(i < 0 || j < 0 || j >= fa.slots.length) return;
+      const list = fa.slots.slice(); [list[i], list[j]] = [list[j], list[i]];
+      const r = await sb.from("feed_slots").upsert(list.map((z, k) => ({id: z.id, name: z.name, hint: z.hint || "", sort: k + 1})));
+      if(r.error) return admErr("Det gick inte att ändra ordningen.");
+      fa.slots = list.map((z, k) => ({...z, sort: k + 1})); admErr("");
+      renderFeedAdmin();
+    }
     $("fa-addslot").addEventListener("submit", async e => {
       e.preventDefault();
       const name = $("fa-newname").value.trim(), hint = $("fa-newhint").value.trim();
@@ -726,6 +755,8 @@
       $("fa-newname").value = ""; $("fa-newhint").value = ""; admErr(""); toast(name + " är tillagt"); loadFeedAdmin();
     });
     $("at-feed").addEventListener("click", async e => {
+      const sv1 = e.target.closest("button[data-fssave]"); if(sv1){ saveSlot(sv1.dataset.fssave, sv1); return; }
+      const mv = e.target.closest("button[data-fsmove]"); if(mv){ moveSlot(mv.dataset.id, Number(mv.dataset.fsmove)); return; }
       const del = e.target.closest("button[data-fsdel]");
       if(del){
         if(del.dataset.sure !== "1"){ del.dataset.sure = "1"; del.textContent = "Säker? Foderstaten för passet tas bort"; del.classList.add("danger"); return; }
@@ -1890,6 +1921,8 @@ body.admin-open{overflow:hidden}
 @media (max-width:640px){.notisbtn{position:static;align-self:flex-start;margin-top:6px}}
 .faslots{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
 .faslots li{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto;gap:8px;align-items:end;padding:10px;background:var(--surface-2);border-radius:8px}
+.fsacts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.fsacts .btn[disabled]{opacity:.45}
 .faadd{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) auto;gap:8px;align-items:end}
 #fa-horses{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:12px}
 .fahorse{background:var(--surface-2);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px}
@@ -1897,7 +1930,7 @@ body.admin-open{overflow:hidden}
 .fahorse textarea{resize:vertical;min-height:44px;font-size:15px}
 .fasave{display:flex;align-items:center;gap:10px}
 .fasave .hint{color:var(--free);font-weight:600}
-@media (max-width:640px){.faslots li,.faadd{grid-template-columns:1fr 1fr}.faslots li .btn,.faadd .btn{grid-column:1/-1;justify-self:start}}
+@media (max-width:640px){.faslots li,.faadd{grid-template-columns:1fr 1fr}.faslots li .fsacts,.faadd .btn{grid-column:1/-1;justify-self:start}}
 .flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
 @media (max-width:640px){
   .member{grid-template-columns:42px minmax(0,1fr)}
@@ -2063,7 +2096,7 @@ body.admin-open{overflow:hidden}
     <div class="adm-panel" id="at-feed" hidden>
       <div class="adm-card">
         <h3>Fodringspass</h3>
-        <p class="hint" style="margin:0">Passen som visas under Sysslor &amp; fodring. Ändringar sparas när du lämnar fältet.</p>
+        <p class="hint" style="margin:0">Passen som visas under Sysslor &amp; fodring. Ändra namn eller tid och tryck <b>Spara</b>. Pilarna ändrar ordningen.</p>
         <ul class="faslots" id="fa-slots"><li class="hint">Hämtar…</li></ul>
         <form class="faadd" id="fa-addslot">
           <div class="field"><label for="fa-newname">Nytt pass</label><input id="fa-newname" maxlength="40" placeholder="t.ex. Eftermiddag"></div>
