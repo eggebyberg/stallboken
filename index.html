@@ -270,6 +270,7 @@
     $("adminBtn").hidden = !me.is_admin;
     show("app");
     resolveReady();
+    setTimeout(() => window.__stallNotis && window.__stallNotis.start(), 600);
   }
   let entered = false, loggingOut = false;
   async function goIn(session){
@@ -455,6 +456,127 @@
       $("log-filter").querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
       logRows = []; $("log-list").innerHTML = '<p class="hint">Hämtar…</p>'; loadLog(false);
     });
+
+    /* ---------- notiser ---------- */
+    (function notiser(){
+      const VAPID_PUBLIC = "BDiRUgYsygkJfg9CU8nUM9RsBVwI4PsM3a-NeDl57gs9v-IkBxz47r1Z8xvxGx-UdYQR48BfLh0h4Me8stRHMqk";
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      const isAndroid = /Android/i.test(navigator.userAgent);
+      const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+      const pushOK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+      const SNOOZE = "stall-notis-snooze", SNOOZE_DAYS = 3;
+      let reg = null, subscribed = false;
+
+      const b64ToU8 = s => { s = s.replace(/-/g, "+").replace(/_/g, "/"); while(s.length % 4) s += "="; const b = atob(s); return Uint8Array.from(b, c => c.charCodeAt(0)); };
+      function snoozed(){ try{ return Number(localStorage.getItem(SNOOZE) || 0) > Date.now(); }catch(_){ return false; } }
+      function snooze(){ try{ localStorage.setItem(SNOOZE, String(Date.now() + SNOOZE_DAYS * 864e5)); }catch(_){} }
+      function state(){
+        if(!pushOK) return (isIOS && !standalone) ? "ios-safari" : "unsupported";
+        return Notification.permission;  // default | granted | denied
+      }
+      async function getReg(){
+        if(!("serviceWorker" in navigator)) return null;
+        if(!reg){ reg = await navigator.serviceWorker.register("sw.js"); }
+        await navigator.serviceWorker.ready;
+        return reg;
+      }
+      async function subscribe(){
+        const r = await getReg();
+        let sub = await r.pushManager.getSubscription();
+        if(!sub) sub = await r.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64ToU8(VAPID_PUBLIC)});
+        const j = sub.toJSON();
+        const res = await sb.rpc("save_push_subscription", {p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth, p_ua: navigator.userAgent});
+        if(res.error) throw res.error;
+        subscribed = true;
+      }
+      async function unsubscribe(){
+        const r = await getReg(); const sub = r && await r.pushManager.getSubscription();
+        if(sub){ await sb.rpc("remove_push_subscription", {p_endpoint: sub.endpoint}); await sub.unsubscribe(); }
+        subscribed = false;
+      }
+
+      /* ---- rutan ---- */
+      const card = $("notisCard");
+      function hideCard(){ card.hidden = true; }
+      function showCard(kind){
+        const howIOS = '<ol class="nsteps"><li>Tryck på <b>dela-ikonen</b> (fyrkanten med en pil uppåt) längst ner i Safari.</li><li>Välj <b>Lägg till på hemskärmen</b> och tryck <b>Lägg till</b>.</li><li>Öppna Stallboken från <b>hemskärmen</b>, så kommer frågan om notiser.</li></ol>';
+        const deniedHelp = isIOS
+          ? '<ol class="nsteps"><li>Öppna <b>Inställningar</b> på telefonen.</li><li>Gå till <b>Notiser</b> och välj <b>Stallboken</b>.</li><li>Slå på <b>Tillåt notiser</b>.</li></ol>'
+          : isAndroid
+          ? '<ol class="nsteps"><li>Håll fingret på Stallboken-ikonen och välj <b>Appinfo</b> (eller tryck på hänglåset bredvid adressen i Chrome).</li><li>Välj <b>Notiser</b> eller <b>Behörigheter</b>.</li><li>Slå på notiser för Stallboken.</li></ol>'
+          : '<p>Tryck på hänglåset bredvid adressen i webbläsaren och tillåt <b>Notiser</b>.</p>';
+        const V = {
+          ask:    {t:"Vill du få ett pling när någon skriver i chatten?", b:"Då ser du direkt när någon i stallet skriver, även när Stallboken är stängd.", yes:"Ja, slå på", no:"Inte nu"},
+          ios:    {t:"Lägg Stallboken på hemskärmen för att få notiser", b:"På iPhone fungerar notiser bara när Stallboken öppnas från hemskärmen." + howIOS, yes:"", no:"Inte nu"},
+          denied: {t:"Notiser är avstängda för Stallboken", b:"Telefonen har sagt nej till notiser. Så slår du på dem:" + deniedHelp, yes:"", no:"Stäng"},
+          off:    {t:"Notiser är på", b:"Du får ett pling när någon annan skriver i chatten.", yes:"Stäng av notiser", no:"Behåll"},
+          nosupport:{t:"Notiser fungerar inte här", b:"Den här webbläsaren kan inte ta emot notiser. Prova Chrome på Android, eller Safari på iPhone med Stallboken på hemskärmen.", yes:"", no:"Stäng"}
+        }[kind];
+        card.dataset.kind = kind;
+        $("nc-title").textContent = V.t;
+        $("nc-body").innerHTML = V.b;
+        $("nc-yes").hidden = !V.yes; $("nc-yes").textContent = V.yes;
+        $("nc-no").textContent = V.no;
+        $("nc-err").hidden = true;
+        card.hidden = false;
+      }
+      function updateBtn(){
+        const b = $("notisBtn"); if(!b) return;
+        const st = state();
+        b.textContent = st === "granted" && subscribed ? "Notiser: på" : st === "denied" ? "Notiser: avstängda" : "Slå på notiser";
+        b.classList.toggle("on", st === "granted" && subscribed);
+      }
+
+      $("nc-no").onclick = () => { if(card.dataset.kind === "ask" || card.dataset.kind === "ios") snooze(); hideCard(); };
+      $("nc-yes").onclick = async () => {
+        const btn = $("nc-yes");
+        if(card.dataset.kind === "off"){
+          btn.disabled = true; try{ await unsubscribe(); toast("Notiserna är avstängda"); }catch(_){}
+          btn.disabled = false; hideCard(); updateBtn(); return;
+        }
+        btn.disabled = true; btn.textContent = "Väntar på svar…";
+        let perm = "default";
+        try{ perm = await Notification.requestPermission(); }catch(_){}
+        if(perm === "granted"){
+          try{ await subscribe(); hideCard(); toast("Notiserna är på"); }
+          catch(e){ $("nc-err").textContent = "Det gick inte att slå på notiserna. Försök igen om en stund."; $("nc-err").hidden = false; }
+        }else if(perm === "denied"){ showCard("denied"); }
+        else { snooze(); hideCard(); }
+        btn.disabled = false; updateBtn();
+      };
+
+      /* knapp i chatten */
+      const head = document.querySelector("#tab-chatt .nbhead");
+      if(head){
+        const nb = document.createElement("button");
+        nb.type = "button"; nb.id = "notisBtn"; nb.className = "btn small notisbtn";
+        head.appendChild(nb);
+        nb.onclick = () => {
+          const st = state();
+          if(st === "ios-safari") return showCard("ios");
+          if(st === "unsupported") return showCard("nosupport");
+          if(st === "denied") return showCard("denied");
+          if(st === "granted" && subscribed) return showCard("off");
+          showCard("ask");
+        };
+      }
+
+      /* klick på en notis när Stallboken redan är öppen */
+      if("serviceWorker" in navigator) navigator.serviceWorker.addEventListener("message", e => {
+        if(e.data && e.data.type === "open-tab"){ const t = document.querySelector('#tabs button[data-tab="' + e.data.tab + '"]'); if(t) t.click(); }
+      });
+
+      window.__stallNotis = {
+        async start(){
+          try{ await getReg(); }catch(_){}
+          const st = state();
+          if(st === "granted"){ try{ await subscribe(); }catch(_){} }
+          else if(st === "default" && !snoozed() && (standalone || !isIOS)) showCard("ask");
+          else if(st === "ios-safari" && !snoozed()) showCard("ios");
+          updateBtn();
+        }
+      };
+    })();
 
     /* logga ut */
     $("logoutBtn").onclick = async () => { loggingOut = true; await sb.auth.signOut().catch(()=>{}); location.replace(location.pathname); };
@@ -1625,6 +1747,19 @@ body.admin-open{overflow:hidden}
 .rchip:has(input:checked){background:var(--tint);border-color:var(--pine)}
 .rchip input{width:18px;height:18px;accent-color:var(--pine);margin:0}
 .rchip i{font-weight:400;color:var(--muted);font-size:12.5px}
+.notiscard{position:fixed;z-index:30;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));width:min(460px,calc(100vw - 24px));
+  background:var(--surface);border:2px solid var(--rope);border-radius:12px;box-shadow:6px 6px 0 rgba(94,58,34,.22);padding:16px;display:flex;gap:12px;align-items:flex-start}
+.notiscard[hidden]{display:none!important}
+.nbell{flex:0 0 auto;width:40px;height:40px;border-radius:50%;background:var(--pine);color:var(--pine-ink);display:grid;place-items:center}
+.ntext{min-width:0;display:flex;flex-direction:column;gap:6px}
+.ntext b{font-family:var(--display);font-size:16px;color:var(--leather);line-height:1.3}
+#nc-body{font-size:14px;color:var(--fg)}
+.nsteps{margin:8px 0 0;padding-left:20px;display:flex;flex-direction:column;gap:4px}
+.nacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.chat .nbhead{position:relative}
+.notisbtn{position:absolute;top:0;right:0}
+.notisbtn.on{background:var(--tint);border-color:var(--pine);color:var(--pine)}
+@media (max-width:640px){.notisbtn{position:static;align-self:flex-start;margin-top:6px}}
 .flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
 @media (max-width:640px){
   .member{grid-template-columns:42px minmax(0,1fr)}
@@ -1716,6 +1851,16 @@ body.admin-open{overflow:hidden}
     <h2>Länken gäller inte</h2>
     <p class="lead">Länken har redan använts eller gått ut. Be den som sköter stallboken om en ny. Har du redan ett konto kan du logga in.</p>
     <button class="btn primary" type="button" id="bl-login">Till inloggningen</button>
+  </div>
+</div>
+
+<div class="notiscard" id="notisCard" hidden role="dialog" aria-labelledby="nc-title">
+  <span class="nbell" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
+  <div class="ntext">
+    <b id="nc-title"></b>
+    <div id="nc-body"></div>
+    <p class="err" id="nc-err" hidden></p>
+    <div class="nacts"><button class="btn primary" type="button" id="nc-yes"></button><button class="btn" type="button" id="nc-no"></button></div>
   </div>
 </div>
 
