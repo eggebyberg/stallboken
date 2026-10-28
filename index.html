@@ -16,19 +16,16 @@
   const SUPABASE_URL = "https://zvusbfxfguyvpxbghvhk.supabase.co";
   const SUPABASE_KEY = "sb_publishable_tzpI16W68KvspONhVd4yqw_KYlYTAhi";
 
-  /* Läs av inbjudnings-/återställningslänken innan klienten städar bort den ur adressen */
+  /* Länkar: #inbjudan=KOD eller #nyttlosen=KOD */
   const startHash = new URLSearchParams(location.hash.replace(/^#/, ""));
-  const startQuery = new URLSearchParams(location.search);
-  let linkType = startHash.get("type") || startQuery.get("type") || "";
-  /* kom ihåg att lösenord ska väljas, även om sidan laddas om mitt i */
-  try{
-    if(linkType === "invite" || linkType === "recovery") sessionStorage.setItem("stall-needpw", linkType);
-    else linkType = sessionStorage.getItem("stall-needpw") || "";
-  }catch(_){}
-  const linkError = startHash.get("error_description") || startQuery.get("error_description") || "";
+  const linkCode = startHash.get("inbjudan") || startHash.get("nyttlosen") || "";
+  const linkKind = startHash.get("inbjudan") ? "invite" : startHash.get("nyttlosen") ? "reset" : "";
+  const BASE = location.origin + location.pathname;
+  /* en ny länk i en redan öppen flik: läs om sidan så länken tas om hand */
+  window.addEventListener("hashchange", () => { if(/(^|[#&])(inbjudan|nyttlosen)=/.test(location.hash)) location.reload(); });
 
   const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "implicit" }
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
   });
   window.__sb = sb;
 
@@ -238,14 +235,17 @@
   };
 
   const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const VIEWS = ["loading","login","register","reset","badlink"];
   function show(view){
     document.body.classList.toggle("authed", view === "app");
     $("auth").hidden = view === "app";
-    ["login","forgot","setpw","sent","loading"].forEach(v => { const el = $("auth-" + v); if(el) el.hidden = v !== view; });
-    if(view !== "app"){ const f = $("auth-" + view); const i = f && f.querySelector("input"); if(i) setTimeout(() => i.focus(), 50); }
+    VIEWS.forEach(v => { const el = $("auth-" + v); if(el) el.hidden = v !== view; });
+    if(view !== "app"){ const f = $("auth-" + view); const i = f && [...f.querySelectorAll("input")].find(x => !x.value); if(i) setTimeout(() => i.focus(), 50); }
   }
   function authErr(form, msg){ const p = $(form + "-err"); p.textContent = msg; p.hidden = !msg; }
   function busy(btn, on, label){ btn.disabled = on; if(label) btn.textContent = label; }
+  const clearLink = () => history.replaceState(null, "", location.pathname);
 
   async function loadMe(session){
     const u = session.user;
@@ -254,7 +254,6 @@
     if(!me.email) me.email = u.email;
     return me;
   }
-
   function enterApp(){
     const name = me.name || (me.email || "").split("@")[0];
     try{ localStorage.setItem("stallboken-name", name); }catch(_){}
@@ -264,33 +263,39 @@
     show("app");
     resolveReady();
   }
-
-  let entered = false, inSetPw = false;
-  async function handleSession(session, evt){
-    if(!session){ entered = false; show("login"); return; }
+  let entered = false;
+  async function goIn(session){
+    if(entered) return;
     await loadMe(session);
-    if(linkType === "invite" || linkType === "recovery" || evt === "PASSWORD_RECOVERY"){
-      if(!inSetPw){
-        inSetPw = true;
-        $("setpw-title").textContent = linkType === "invite" ? "Välkommen till Stallboken!" : "Välj ett nytt lösenord";
-        $("setpw-lead").textContent = linkType === "invite" ? "Skriv ditt namn och välj ett lösenord. Sedan loggar du in med din e-post och lösenordet." : "Skriv ditt nya lösenord två gånger.";
-        $("sp-name-wrap").hidden = linkType !== "invite";
-        $("sp-name").value = me.name || "";
-        show("setpw");
-      }
-      return;
-    }
-    if(!entered){ entered = true; enterApp(); }
+    if(entered) return;
+    entered = true; enterApp();
+  }
+
+  async function openLink(){
+    const r = await sb.rpc("check_code", {p_code: linkCode});
+    const info = r.data || {valid:false};
+    if(!info.valid){ show("badlink"); return; }
+    if(linkKind === "invite" && info.kind === "invite"){
+      $("rg-name").value = info.name || "";
+      show("register");
+    }else if(linkKind === "reset" && info.kind === "reset"){
+      $("rs-who").textContent = (info.name || "") + (info.email ? " (" + info.email + ")" : "");
+      $("rs-email").value = info.email || "";
+      show("reset");
+    }else show("badlink");
   }
 
   document.addEventListener("DOMContentLoaded", () => {
     show("loading");
-    if(linkError){ show("login"); authErr("login", "Länken fungerar inte längre. Den kan ha använts redan eller gått ut. Be om en ny inbjudan, eller använd Glömt lösenord."); }
 
     sb.auth.onAuthStateChange((evt, session) => {
       if(evt === "SIGNED_OUT"){ location.replace(location.pathname); return; }
-      if(evt === "INITIAL_SESSION" || evt === "SIGNED_IN" || evt === "PASSWORD_RECOVERY"){
-        setTimeout(() => handleSession(session, evt), 0);
+      if(evt === "INITIAL_SESSION"){
+        setTimeout(() => {
+          if(linkCode) openLink();
+          else if(session) goIn(session);
+          else show("login");
+        }, 0);
       }
     });
 
@@ -298,82 +303,118 @@
     $("auth-login").addEventListener("submit", async e => {
       e.preventDefault(); authErr("login", "");
       const btn = $("li-btn"); busy(btn, true, "Loggar in…");
-      const {error} = await sb.auth.signInWithPassword({email:$("li-email").value.trim(), password:$("li-pw").value});
+      const {data, error} = await sb.auth.signInWithPassword({email:$("li-email").value.trim(), password:$("li-pw").value});
       busy(btn, false, "Logga in");
-      if(error) authErr("login", /invalid/i.test(error.message) ? "Fel e-post eller lösenord." : "Det gick inte att logga in just nu. Försök igen om en stund.");
+      if(error) return authErr("login", /invalid/i.test(error.message) ? "Fel e-post eller lösenord." : "Det gick inte att logga in just nu. Försök igen om en stund.");
+      goIn(data.session);
     });
-    $("li-forgot").onclick = () => { $("fg-email").value = $("li-email").value; authErr("forgot", ""); show("forgot"); };
-    $("fg-back").onclick = () => show("login");
-    $("sent-back").onclick = () => show("login");
+    $("bl-login").onclick = () => { clearLink(); show("login"); };
 
-    /* glömt lösenord */
-    $("auth-forgot").addEventListener("submit", async e => {
-      e.preventDefault(); authErr("forgot", "");
-      const btn = $("fg-btn"); busy(btn, true, "Skickar…");
-      const {error} = await sb.auth.resetPasswordForEmail($("fg-email").value.trim(), {redirectTo: location.origin + location.pathname});
-      busy(btn, false, "Skicka länk");
-      if(error && /rate|limit/i.test(error.message)) return authErr("forgot", "Det har skickats för många mejl. Vänta en stund och försök igen.");
-      $("sent-to").textContent = $("fg-email").value.trim();
-      show("sent");
+    /* registrera via inbjudan */
+    $("auth-register").addEventListener("submit", async e => {
+      e.preventDefault(); authErr("register", "");
+      const name = $("rg-name").value.trim(), email = $("rg-email").value.trim(), pw = $("rg-pw").value, pw2 = $("rg-pw2").value;
+      if(!name) return authErr("register", "Skriv ditt namn, så vet alla vem som bokar.");
+      if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr("register", "Skriv en riktig e-postadress. Den använder du när du loggar in.");
+      if(pw.length < 8) return authErr("register", "Lösenordet behöver vara minst 8 tecken.");
+      if(pw !== pw2) return authErr("register", "Lösenorden är inte likadana. Skriv samma två gånger.");
+      const btn = $("rg-btn"); busy(btn, true, "Skapar konto…");
+      await sb.auth.signOut({scope:"local"}).catch(()=>{});
+      const {data, error} = await sb.auth.signUp({email, password:pw, options:{data:{invite:linkCode, name}}});
+      busy(btn, false, "Skapa konto och gå in");
+      if(error){
+        const m = error.message || "";
+        if(/already|registered|exists/i.test(m)) return authErr("register", "Den e-postadressen finns redan i Stallboken. Logga in i stället.");
+        if(/database error|saving new user|inbjudan/i.test(m)) return authErr("register", "Inbjudan gäller inte längre. Be om en ny länk.");
+        if(/password/i.test(m)) return authErr("register", "Välj ett starkare lösenord, minst 8 tecken.");
+        return authErr("register", "Det gick inte att skapa kontot. Försök igen om en stund.");
+      }
+      if(!data.session) return authErr("register", "Kontot skapades, men e-postbekräftelse är påslagen i Supabase. Stäng av Confirm email och logga in.");
+      clearLink(); goIn(data.session);
     });
 
-    /* välj lösenord (inbjudan eller återställning) */
-    $("auth-setpw").addEventListener("submit", async e => {
-      e.preventDefault(); authErr("setpw", "");
-      const pw = $("sp-pw").value, pw2 = $("sp-pw2").value, name = $("sp-name").value.trim();
-      if(!$("sp-name-wrap").hidden && !name) return authErr("setpw", "Skriv ditt namn, så vet alla vem som bokar.");
-      if(pw.length < 8) return authErr("setpw", "Lösenordet behöver vara minst 8 tecken.");
-      if(pw !== pw2) return authErr("setpw", "Lösenorden är inte likadana. Skriv samma två gånger.");
-      const btn = $("sp-btn"); busy(btn, true, "Sparar…");
-      const upd = await sb.auth.updateUser({password:pw, data: name ? {name} : undefined});
-      if(upd.error){ busy(btn, false, "Spara och gå in"); return authErr("setpw", /same|different/i.test(upd.error.message) ? "Välj ett annat lösenord än det gamla." : "Det gick inte att spara lösenordet. Försök igen."); }
-      if(name){ await sb.from("profiles").update({name}).eq("id", me.id); me.name = name; }
-      history.replaceState(null, "", location.pathname);
-      try{ sessionStorage.removeItem("stall-needpw"); }catch(_){}
-      linkType = "";
-      inSetPw = false; entered = true; enterApp();
+    /* nytt lösenord via länk */
+    $("auth-reset").addEventListener("submit", async e => {
+      e.preventDefault(); authErr("reset", "");
+      const pw = $("rs-pw").value, pw2 = $("rs-pw2").value;
+      if(pw.length < 8) return authErr("reset", "Lösenordet behöver vara minst 8 tecken.");
+      if(pw !== pw2) return authErr("reset", "Lösenorden är inte likadana. Skriv samma två gånger.");
+      const btn = $("rs-btn"); busy(btn, true, "Sparar…");
+      const r = await sb.rpc("reset_password", {p_code: linkCode, p_password: pw});
+      if(r.error){ busy(btn, false, "Spara och gå in"); return authErr("reset", /gäller inte/i.test(r.error.message) ? "Länken gäller inte längre. Be om en ny." : "Det gick inte att spara. Försök igen."); }
+      await sb.auth.signOut({scope:"local"}).catch(()=>{});
+      const {data, error} = await sb.auth.signInWithPassword({email: r.data, password: pw});
+      busy(btn, false, "Spara och gå in");
+      clearLink();
+      if(error){ $("li-email").value = r.data; show("login"); return authErr("login", "Lösenordet är bytt. Logga in med det nya."); }
+      goIn(data.session);
     });
 
     /* logga ut */
     $("logoutBtn").onclick = async () => { await sb.auth.signOut(); };
 
-    /* ---------- admin: bjud in och hantera ryttare ---------- */
+    /* ---------- admin: länkar och ryttare ---------- */
+    const linkText = (url, kind, name) => kind === "reset"
+      ? `Hej${name ? " " + name : ""}! Här är en länk där du väljer ett nytt lösenord till Stallboken Eggebyberg (gäller i 2 dagar):\n${url}`
+      : `Hej${name ? " " + name : ""}! Här är din inbjudan till Stallboken Eggebyberg. Öppna länken, skriv din e-post och välj ett lösenord (gäller i 7 dagar, en gång):\n${url}`;
+
+    function showShare(code, kind, name){
+      const url = BASE + (kind === "reset" ? "#nyttlosen=" : "#inbjudan=") + code;
+      const text = linkText(url, kind, name);
+      $("sh-title").textContent = kind === "reset" ? "Länk för nytt lösenord" + (name ? " till " + name : "") : "Inbjudan" + (name ? " till " + name : "") + " är klar";
+      $("sh-text").value = text;
+      $("sh-sms").href = "sms:?&body=" + encodeURIComponent(text);
+      $("sh-share").hidden = !navigator.share;
+      $("share").hidden = false;
+      $("share").scrollIntoView({block:"nearest"});
+    }
+    $("sh-copy").onclick = async () => {
+      const t = $("sh-text");
+      try{ await navigator.clipboard.writeText(t.value); $("sh-copy").textContent = "Kopierat!"; }
+      catch(_){ t.select(); document.execCommand && document.execCommand("copy"); $("sh-copy").textContent = "Markerat – kopiera"; }
+      setTimeout(() => $("sh-copy").textContent = "Kopiera", 2000);
+    };
+    $("sh-share").onclick = () => { navigator.share({text: $("sh-text").value}).catch(()=>{}); };
+    $("sh-done").onclick = () => { $("share").hidden = true; };
+
     async function loadMembers(){
+      const [pr, iv] = await Promise.all([
+        sb.from("profiles").select("id,name,email,is_admin,created_at").order("created_at"),
+        sb.from("invites").select("code,kind,name,expires_at,target_user").is("used_at", null).gt("expires_at", new Date().toISOString()).order("created_at")
+      ]);
       const list = $("inv-list");
-      const r = await sb.from("profiles").select("id,name,email,is_admin,created_at").order("created_at");
-      if(r.error){ list.innerHTML = '<li class="inv-empty">Kunde inte hämta listan.</li>'; return; }
-      list.innerHTML = r.data.map(p => `<li><span class="n"><b>${esc(p.name || "(inget namn än)")}</b><span>${esc(p.email || "")}${p.is_admin ? " · admin" : ""}</span></span>${p.id === me.id || p.is_admin ? "" : `<button class="btn small" type="button" data-rm="${p.id}" data-name="${esc(p.name || p.email)}">Ta bort</button>`}</li>`).join("");
+      if(pr.error){ list.innerHTML = '<li>Kunde inte hämta listan.</li>'; return; }
+      list.innerHTML = pr.data.map(p => `<li><span class="n"><b>${esc(p.name || "(inget namn)")}</b><span>${esc(p.email || "")}${p.is_admin ? " · admin" : ""}</span></span>
+        <span class="acts"><button class="btn small" type="button" data-reset="${p.id}" data-name="${esc(p.name)}">Nytt lösenord</button>${p.id === me.id || p.is_admin ? "" : `<button class="btn small" type="button" data-rm="${p.id}">Ta bort</button>`}</span></li>`).join("");
+      const pend = (iv.data || []).filter(i => i.kind === "invite");
+      $("inv-pending").innerHTML = pend.length ? pend.map(i => `<li><span class="n"><b>${esc(i.name || "Inbjudan")}</b><span>Ej använd · gäller till ${new Date(i.expires_at).toLocaleDateString("sv-SE")}</span></span>
+        <span class="acts"><button class="btn small" type="button" data-show="${i.code}" data-name="${esc(i.name)}">Visa länk</button><button class="btn small" type="button" data-drop="${i.code}">Ta bort</button></span></li>`).join("")
+        : '<li class="muted">Inga obesvarade inbjudningar.</li>';
     }
-    const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-    async function callAdmin(body){
-      const {data, error} = await sb.functions.invoke("invite", {body});
-      if(error){
-        let msg = "Det gick inte. Försök igen om en stund.";
-        try{ const j = await error.context.json(); if(j && j.error) msg = j.error; }catch(_){}
-        throw new Error(msg);
-      }
-      return data;
-    }
-    $("inviteBtn").onclick = () => { $("inv-err").hidden = true; $("inv-ok").hidden = true; $("inv-email").value = ""; $("inv-name").value = ""; loadMembers(); $("inviteDlg").showModal(); };
+    $("inviteBtn").onclick = () => { $("inv-err").hidden = true; $("share").hidden = true; $("inv-name").value = ""; loadMembers(); $("inviteDlg").showModal(); };
     $("inv-close").onclick = () => $("inviteDlg").close();
     $("inv-form").addEventListener("submit", async e => {
-      e.preventDefault();
-      const email = $("inv-email").value.trim(), name = $("inv-name").value.trim();
-      $("inv-err").hidden = true; $("inv-ok").hidden = true;
-      const btn = $("inv-btn"); busy(btn, true, "Skickar…");
-      try{
-        await callAdmin({action:"invite", email, name, redirectTo: location.origin + location.pathname});
-        $("inv-ok").textContent = `Inbjudan är skickad till ${email}.`; $("inv-ok").hidden = false;
-        $("inv-email").value = ""; $("inv-name").value = ""; loadMembers();
-      }catch(x){ $("inv-err").textContent = x.message; $("inv-err").hidden = false; }
-      busy(btn, false, "Skicka inbjudan");
+      e.preventDefault(); $("inv-err").hidden = true;
+      const name = $("inv-name").value.trim(); const btn = $("inv-btn"); busy(btn, true, "Skapar…");
+      const r = await sb.rpc("create_invite", {p_name: name});
+      busy(btn, false, "Skapa inbjudningslänk");
+      if(r.error){ $("inv-err").textContent = "Det gick inte att skapa länken. Försök igen."; $("inv-err").hidden = false; return; }
+      $("inv-name").value = ""; showShare(r.data, "invite", name); loadMembers();
     });
-    $("inv-list").addEventListener("click", async e => {
-      const b = e.target.closest("button[data-rm]"); if(!b) return;
+    $("inviteDlg").addEventListener("click", async e => {
+      const b = e.target.closest("button[data-reset],button[data-rm],button[data-show],button[data-drop]"); if(!b) return;
+      $("inv-err").hidden = true;
+      const fail = msg => { $("inv-err").textContent = msg; $("inv-err").hidden = false; b.disabled = false; };
+      if(b.dataset.show){ showShare(b.dataset.show, "invite", b.dataset.name); return; }
+      if(b.dataset.reset){
+        b.disabled = true; const r = await sb.rpc("create_reset", {p_user: b.dataset.reset}); b.disabled = false;
+        if(r.error) return fail("Det gick inte att skapa länken."); showShare(r.data, "reset", b.dataset.name); return;
+      }
       if(b.dataset.sure !== "1"){ b.dataset.sure = "1"; b.textContent = "Säker? Tryck igen"; b.classList.add("danger"); return; }
       b.disabled = true;
-      try{ await callAdmin({action:"remove", userId:b.dataset.rm}); loadMembers(); }
-      catch(x){ $("inv-err").textContent = x.message; $("inv-err").hidden = false; b.disabled = false; }
+      if(b.dataset.rm){ const r = await sb.rpc("remove_member", {p_user: b.dataset.rm}); if(r.error) return fail("Det gick inte att ta bort personen."); }
+      if(b.dataset.drop){ const r = await sb.from("invites").delete().eq("code", b.dataset.drop); if(r.error) return fail("Det gick inte att ta bort inbjudan."); }
+      loadMembers();
     });
   });
 })();
@@ -1394,12 +1435,21 @@ body:not(.authed) .wrap{display:none}
 body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
 /* admin-dialogen */
 #inviteDlg .sheet{gap:14px}
-#inv-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;max-height:36vh;overflow:auto}
-#inv-list li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:var(--surface-2);border-radius:6px}
-#inv-list .n{min-width:0}
-#inv-list .n b{display:block}
-#inv-list .n span{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
-#inv-ok{color:var(--free);font-weight:600;margin:0}
+#inviteDlg{width:min(520px,calc(100vw - 32px))}
+.inv-new{display:flex;gap:10px;align-items:end;flex-wrap:wrap}
+.inv-new .field{flex:1 1 200px}
+.share{background:var(--pin-bg);border:1.5px solid var(--pin-line);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px}
+.share textarea{width:100%;resize:none;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--surface);font-size:14px;line-height:1.4}
+.share-acts{display:flex;gap:8px;flex-wrap:wrap}
+.share-acts a.btn{text-decoration:none;display:inline-flex;align-items:center;color:var(--fg)}
+.inv-h{margin:4px 0 0;font-family:var(--display);font-size:15px;color:var(--leather)}
+.inv-ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.inv-ul li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:var(--surface-2);border-radius:6px;flex-wrap:wrap}
+.inv-ul li.muted{color:var(--muted);font-size:13.5px}
+.inv-ul .n{min-width:0;flex:1 1 160px}
+.inv-ul .n b{display:block}
+.inv-ul .n span{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.inv-ul .acts{display:flex;gap:6px;flex-wrap:wrap}
 @media (max-width:640px){
   body.authed header.top{flex-wrap:wrap;gap:10px;padding-bottom:12px}
   body.authed .brand{flex:1 1 100%}
@@ -1426,51 +1476,68 @@ body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
     <div class="field"><label for="li-pw">Lösenord</label><input id="li-pw" type="password" autocomplete="current-password" required></div>
     <p class="err" id="login-err" hidden></p>
     <button class="btn primary" type="submit" id="li-btn">Logga in</button>
-    <button class="linkish" type="button" id="li-forgot">Glömt lösenord?</button>
-    <p class="hint" style="text-align:center">Stallboken är bara för inbjudna. Saknar du konto, be den som sköter stallboken om en inbjudan.</p>
+    <p class="hint" style="text-align:center">Glömt lösenordet, eller saknar du konto? Be den som sköter stallboken om en länk.</p>
   </form>
 
-  <form class="auth-card" id="auth-forgot" hidden novalidate>
-    <h2>Glömt lösenord</h2>
-    <p class="lead">Skriv din e-post så skickar vi en länk där du väljer ett nytt lösenord.</p>
-    <div class="field"><label for="fg-email">E-post</label><input id="fg-email" type="email" autocomplete="email" required></div>
-    <p class="err" id="forgot-err" hidden></p>
-    <button class="btn primary" type="submit" id="fg-btn">Skicka länk</button>
-    <button class="linkish" type="button" id="fg-back">Tillbaka till inloggning</button>
-  </form>
-
-  <div class="auth-card" id="auth-sent" hidden>
-    <h2>Kolla din e-post</h2>
-    <p class="lead">Om <b id="sent-to"></b> finns i Stallboken har vi skickat en länk dit. Öppna mejlet och tryck på länken. Titta i skräpposten om det dröjer.</p>
-    <button class="linkish" type="button" id="sent-back">Tillbaka till inloggning</button>
-  </div>
-
-  <form class="auth-card" id="auth-setpw" hidden novalidate>
-    <h2 id="setpw-title">Välj lösenord</h2>
-    <p class="lead" id="setpw-lead"></p>
-    <div class="field" id="sp-name-wrap"><label for="sp-name">Ditt namn</label><input id="sp-name" maxlength="40" autocomplete="name" placeholder="Så som de andra i stallet känner dig"></div>
-    <div class="field"><label for="sp-pw">Lösenord</label><input id="sp-pw" type="password" autocomplete="new-password" minlength="8" required></div>
-    <div class="field"><label for="sp-pw2">Upprepa lösenordet</label><input id="sp-pw2" type="password" autocomplete="new-password" minlength="8" required></div>
+  <form class="auth-card" id="auth-register" hidden novalidate>
+    <h2>Välkommen till Stallboken!</h2>
+    <p class="lead">Du är inbjuden. Skriv ditt namn och din e-post och välj ett lösenord. Sedan loggar du in med e-posten och lösenordet.</p>
+    <div class="field"><label for="rg-name">Ditt namn</label><input id="rg-name" maxlength="40" autocomplete="name" placeholder="Så som de andra i stallet känner dig"></div>
+    <div class="field"><label for="rg-email">E-post</label><input id="rg-email" type="email" autocomplete="email" required></div>
+    <div class="field"><label for="rg-pw">Lösenord</label><input id="rg-pw" type="password" autocomplete="new-password" minlength="8" required></div>
+    <div class="field"><label for="rg-pw2">Upprepa lösenordet</label><input id="rg-pw2" type="password" autocomplete="new-password" minlength="8" required></div>
     <p class="hint">Minst 8 tecken.</p>
-    <p class="err" id="setpw-err" hidden></p>
-    <button class="btn primary" type="submit" id="sp-btn">Spara och gå in</button>
+    <p class="err" id="register-err" hidden></p>
+    <button class="btn primary" type="submit" id="rg-btn">Skapa konto och gå in</button>
   </form>
+
+  <form class="auth-card" id="auth-reset" hidden novalidate>
+    <h2>Välj ett nytt lösenord</h2>
+    <p class="lead">För <b id="rs-who"></b>.</p>
+    <input type="email" id="rs-email" autocomplete="username" hidden>
+    <div class="field"><label for="rs-pw">Nytt lösenord</label><input id="rs-pw" type="password" autocomplete="new-password" minlength="8" required></div>
+    <div class="field"><label for="rs-pw2">Upprepa lösenordet</label><input id="rs-pw2" type="password" autocomplete="new-password" minlength="8" required></div>
+    <p class="hint">Minst 8 tecken.</p>
+    <p class="err" id="reset-err" hidden></p>
+    <button class="btn primary" type="submit" id="rs-btn">Spara och gå in</button>
+  </form>
+
+  <div class="auth-card" id="auth-badlink" hidden>
+    <h2>Länken gäller inte</h2>
+    <p class="lead">Länken har redan använts eller gått ut. Be den som sköter stallboken om en ny. Har du redan ett konto kan du logga in.</p>
+    <button class="btn primary" type="button" id="bl-login">Till inloggningen</button>
+  </div>
 </div>
 
 <dialog id="inviteDlg">
   <div class="sheet">
     <h3>Ryttare i Stallboken</h3>
-    <ul id="inv-list"><li class="inv-empty">Hämtar…</li></ul>
-    <form id="inv-form" style="display:flex;flex-direction:column;gap:10px">
-      <div class="field"><label for="inv-email">E-post till den du vill bjuda in</label><input id="inv-email" type="email" required placeholder="namn@exempel.se"></div>
-      <div class="field"><label for="inv-name">Namn (valfritt)</label><input id="inv-name" maxlength="40" placeholder="Fylls i av personen själv annars"></div>
-      <p class="err" id="inv-err" hidden></p>
-      <p id="inv-ok" hidden></p>
-      <div class="actions">
-        <button class="btn" type="button" id="inv-close">Stäng</button>
-        <button class="btn primary" type="submit" id="inv-btn">Skicka inbjudan</button>
-      </div>
+
+    <form id="inv-form" class="inv-new">
+      <div class="field"><label for="inv-name">Bjud in någon ny · namn (valfritt)</label><input id="inv-name" maxlength="40" placeholder="t.ex. Maja"></div>
+      <button class="btn primary" type="submit" id="inv-btn">Skapa inbjudningslänk</button>
     </form>
+
+    <div class="share" id="share" hidden>
+      <b id="sh-title"></b>
+      <label class="sr" for="sh-text">Text att skicka</label>
+      <textarea id="sh-text" rows="5" readonly></textarea>
+      <div class="share-acts">
+        <button class="btn primary" type="button" id="sh-copy">Kopiera</button>
+        <button class="btn" type="button" id="sh-share" hidden>Dela…</button>
+        <a class="btn" id="sh-sms" href="#">Öppna sms</a>
+        <button class="btn" type="button" id="sh-done">Klar</button>
+      </div>
+    </div>
+
+    <p class="err" id="inv-err" hidden></p>
+
+    <h4 class="inv-h">Med i stallboken</h4>
+    <ul id="inv-list" class="inv-ul"><li>Hämtar…</li></ul>
+    <h4 class="inv-h">Väntar på att registrera sig</h4>
+    <ul id="inv-pending" class="inv-ul"></ul>
+
+    <div class="actions"><button class="btn" type="button" id="inv-close">Stäng</button></div>
   </div>
 </dialog>
 
