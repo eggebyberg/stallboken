@@ -1,0 +1,24 @@
+{
+  "name": "Stallboken Eggebyberg",
+  "short_name": "Stallboken",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f1e3c8",
+  "theme_color": "#f1e3c8",
+  "lang": "sv",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
