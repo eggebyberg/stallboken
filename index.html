@@ -349,6 +349,45 @@
       goIn(data.session);
     });
 
+    /* ---------- hästar: välj bland registrerade ryttare ---------- */
+    (function riderPicker(){
+      const input = $("mRiders"); if(!input) return;
+      const field = input.closest(".field"), oldHint = field.nextElementSibling;
+      field.hidden = true; if(oldHint && oldHint.classList.contains("hint")) oldHint.hidden = true;
+      const box = document.createElement("div");
+      box.className = "field";
+      box.innerHTML = '<span class="flabel">Ryttare (valfritt)</span><div class="rpick" id="rpick"></div><p class="hint" style="margin:0">Bocka i vilka som rider hästen. Du kan ändra det senare med Ändra.</p>';
+      field.after(box);
+      let people = [];
+      const current = () => input.value.split(",").map(x => x.trim()).filter(Boolean);
+      function sync(){
+        const cur = current();
+        const all = [...new Set([...people, ...cur])].sort((a, b) => a.localeCompare(b, "sv"));
+        $("rpick").innerHTML = all.length
+          ? all.map(n => `<label class="rchip"><input type="checkbox" value="${esc(n)}"${cur.includes(n) ? " checked" : ""}><span>${esc(n)}${people.includes(n) ? "" : ' <i>(ej registrerad)</i>'}</span></label>`).join("")
+          : '<p class="hint" style="margin:0">Inga registrerade ryttare än. Bjud in dem via Admin.</p>';
+      }
+      async function load(){
+        const r = await sb.from("profiles").select("name,email").order("name");
+        people = [...new Set((r.data || []).map(p => p.name || (p.email || "").split("@")[0]).filter(Boolean))];
+        sync();
+      }
+      $("rpick").addEventListener("change", () => {
+        input.value = [...$("rpick").querySelectorAll("input:checked")].map(i => i.value).join(", ");
+      });
+      /* när dialogen öppnas: hämta ryttare. När formuläret byter läge (ny/ändra): visa rätt bockar */
+      new MutationObserver(() => { if($("manageDlg").open) load(); }).observe($("manageDlg"), {attributes:true, attributeFilter:["open"]});
+      new MutationObserver(() => setTimeout(sync, 0)).observe($("mSave"), {childList:true, characterData:true, subtree:true});
+      $("mList").addEventListener("click", e => { if(e.target.closest('[data-m="edit"]')) setTimeout(sync, 0); });
+    })();
+
+    /* boka: välj dig själv som ryttare om du rider hästen */
+    new MutationObserver(() => {
+      if(!$("bookDlg").open || !me) return;
+      const sel = $("bRider"), mine = me.name || "";
+      if(mine && [...sel.options].some(o => o.value === mine)){ sel.value = mine; sel.dispatchEvent(new Event("change")); }
+    }).observe($("bookDlg"), {attributes:true, attributeFilter:["open"]});
+
     /* ---------- admin: logg ---------- */
     const LOGPAGE = 150; let logRows = [], logArea = "", logDone = false;
     async function loadLog(more){
@@ -1552,6 +1591,11 @@ body.admin-open{overflow:hidden}
 .seg button[aria-checked="true"]{background:var(--leather);color:var(--pine-ink)}
 .seg button:disabled{cursor:not-allowed;opacity:.6}
 .inv-new .seg{align-self:flex-start}
+.rpick{display:flex;flex-wrap:wrap;gap:8px}
+.rchip,.field label.rchip{text-transform:none;font-size:14px;letter-spacing:0;color:var(--fg);display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1.5px solid var(--rope);border-radius:999px;background:var(--surface);cursor:pointer;font-weight:600;font-size:14px}
+.rchip:has(input:checked){background:var(--tint);border-color:var(--pine)}
+.rchip input{width:18px;height:18px;accent-color:var(--pine);margin:0}
+.rchip i{font-weight:400;color:var(--muted);font-size:12.5px}
 .flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
 @media (max-width:640px){
   .member{grid-template-columns:42px minmax(0,1fr)}
