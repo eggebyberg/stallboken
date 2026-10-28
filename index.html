@@ -918,7 +918,6 @@
         <dt>Vind</dt><dd>${Math.round(c.wind_speed_10m)} m/s${c.wind_gusts_10m >= c.wind_speed_10m + 3 ? ` (byar ${Math.round(c.wind_gusts_10m)})` : ""}</dd>
         <dt>I dag</dt><dd>${deg(d.temperature_2m_min[0])} till ${deg(d.temperature_2m_max[0])}</dd>
         <dt>Sol</dt><dd>upp ${hm(d.sunrise[0])}, ner ${hm(d.sunset[0])}</dd>
-        <dt>Täcke</dt><dd>${blanket(c.apparent_temperature, wet)}</dd>
       </dl>
       <a class="wp-src" href="https://open-meteo.com/" target="_blank" rel="noopener">Väder från Open-Meteo.com</a>`;
     chip.hidden = false;
