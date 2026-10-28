@@ -833,6 +833,131 @@
 })();
 
 </script>
+<script>
+/* Stallboken Eggebyberg – vädret i Gistad (Open-Meteo, ingen nyckel behövs) */
+(function(){
+  const LAT = 58.45, LON = 15.90, PLACE = "Eggebyberg";
+  const URL_ = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
+    "&current=temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,is_day" +
+    "&hourly=temperature_2m,weather_code,precipitation_probability,is_day" +
+    "&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min" +
+    "&wind_speed_unit=ms&timezone=Europe%2FStockholm&forecast_days=2";
+  const CACHE = "stall-vader", MAX_AGE = 20 * 60 * 1000;
+
+  const TEXT = c =>
+    c === 0 ? "Klart" : c === 1 ? "Mestadels klart" : c === 2 ? "Halvklart" : c === 3 ? "Mulet" :
+    c === 45 || c === 48 ? "Dimma" : c >= 51 && c <= 55 ? "Duggregn" : c === 56 || c === 57 ? "Underkylt duggregn" :
+    c >= 61 && c <= 65 ? "Regn" : c === 66 || c === 67 ? "Underkylt regn" : c >= 71 && c <= 75 ? "Snöfall" :
+    c === 77 ? "Snökorn" : c >= 80 && c <= 82 ? "Regnskurar" : c === 85 || c === 86 ? "Snöbyar" :
+    c === 95 ? "Åska" : c >= 96 ? "Åska med hagel" : "Väder";
+  const KIND = c =>
+    c <= 1 ? "sun" : c === 2 ? "part" : c === 3 ? "cloud" : c === 45 || c === 48 ? "fog" :
+    (c >= 71 && c <= 77) || c === 85 || c === 86 ? "snow" : c >= 95 ? "storm" : "rain";
+
+  /* ikoner i stallets färger */
+  function icon(code, day, size){
+    const k = KIND(code), s = size || 56;
+    const sun = day
+      ? '<circle cx="24" cy="24" r="9" fill="var(--pine)"/>' + [0,45,90,135,180,225,270,315].map(a => { const r = a * Math.PI / 180; return `<line x1="${24+14*Math.cos(r)}" y1="${24+14*Math.sin(r)}" x2="${24+19*Math.cos(r)}" y2="${24+19*Math.sin(r)}" stroke="var(--pine)" stroke-width="3" stroke-linecap="round"/>`; }).join("")
+      : '<path d="M30 10a14 14 0 1 0 10 22a11 11 0 1 1-10-22z" fill="var(--leather)"/><circle cx="12" cy="10" r="1.6" fill="var(--rope)"/><circle cx="40" cy="8" r="1.3" fill="var(--rope)"/>';
+    const cloud = (x, y, fill) => `<path transform="translate(${x} ${y})" d="M10 26h24a8 8 0 0 0 0-16a11 11 0 0 0-21-2a9 9 0 0 0-3 18z" fill="${fill}" stroke="var(--leather)" stroke-width="2"/>`;
+    let g = "";
+    if(k === "sun") g = sun;
+    else if(k === "part") g = `<g transform="translate(-6 -6) scale(.85)">${sun}</g>` + cloud(8, 14, "var(--surface)");
+    else if(k === "cloud") g = cloud(2, 8, "var(--surface-2)");
+    else if(k === "fog") g = cloud(2, 2, "var(--surface-2)") + [34,39,44].map(y => `<line x1="8" y1="${y}" x2="40" y2="${y}" stroke="var(--muted)" stroke-width="2.5" stroke-linecap="round"/>`).join("");
+    else if(k === "rain") g = cloud(2, 2, "var(--surface-2)") + [[14,32],[24,36],[34,32]].map(([x,y]) => `<line x1="${x}" y1="${y}" x2="${x-3}" y2="${y+8}" stroke="var(--pine)" stroke-width="2.5" stroke-linecap="round"/>`).join("");
+    else if(k === "snow") g = cloud(2, 2, "var(--surface-2)") + [[14,36],[24,42],[34,36]].map(([x,y]) => `<text x="${x}" y="${y}" font-size="11" text-anchor="middle" fill="var(--leather)">✻</text>`).join("");
+    else g = cloud(2, 2, "var(--surface-2)") + '<path d="M25 28l-6 10h6l-3 9l10-13h-6l3-6z" fill="var(--pin)"/>';
+    return `<svg viewBox="0 0 48 48" width="${s}" height="${s}" aria-hidden="true">${g}</svg>`;
+  }
+
+  /* stallkommentaren */
+  function quip(c){
+    const t = c.temperature_2m, f = c.apparent_temperature, w = c.wind_speed_10m, g = c.wind_gusts_10m, code = c.weather_code;
+    if(code >= 95) return "Åska i närheten. Hästarna in, och ingen ridning ute nu.";
+    if(code === 56 || code === 57 || code === 66 || code === 67) return "Underkylt regn. Halt i hagen och på gårdsplanen, ta det lugnt!";
+    if(t <= 0 && (code >= 61 && code <= 67)) return "Regn på frusen mark. Halkvarning i hagen!";
+    if(g >= 14) return "Hårda vindbyar. Räkna med pigga hästar och flygande täcken.";
+    if(code >= 71 && code <= 86 && KIND(code) === "snow") return "Snö! Kolla hovarna efter snöklumpar innan ridningen.";
+    if(t <= -10) return "Riktigt kallt. Kolla att vattnet inte har frusit.";
+    if(t <= 0) return "Minusgrader. Kolla vattnet och se upp för halka i hagen.";
+    if(code >= 61 && code <= 82) return "Regnigt. En bra dag att putsa sadeln i stallet.";
+    if(code === 45 || code === 48) return "Dimma. Reflexväst på om du rider ut.";
+    if(w >= 9) return "Blåsigt. Hästarna kan vara extra pigga i dag.";
+    if(t >= 26) return "Varmt! Gott om vatten, skugga och kanske en dusch för hästarna.";
+    if(code <= 2 && t >= 8 && t <= 22 && w < 7) return c.is_day ? "Perfekt ridväder! Ut och njut." : "Lugn och fin kväll i stallet.";
+    if(code <= 2 && !c.is_day) return "Klar kväll. Stjärnhimmel över hagen.";
+    if(code === 3) return "Grått men torrt. Fullt ridbart.";
+    return c.is_day ? "Ha en fin dag i stallet!" : "Ha en fin kväll i stallet!";
+  }
+  /* täckestips (ungefärligt, varje häst är olika) */
+  function blanket(f, wet){
+    if(f >= 16) return wet ? "Regntäcke utan foder vid behov" : "Inget täcke";
+    if(f >= 10) return wet ? "Tunt regntäcke" : "Inget eller tunt täcke";
+    if(f >= 5)  return "Tunt till mellantjockt täcke";
+    if(f >= 0)  return "Mellantjockt täcke";
+    if(f >= -10) return "Vintertäcke";
+    return "Tjockt vintertäcke";
+  }
+
+  const pad = n => String(n).padStart(2, "0");
+  const hm = s => s.slice(11, 16);
+  const deg = v => (Math.round(v) === 0 ? 0 : Math.round(v)) + "°";
+
+  function render(j){
+    const chip = document.getElementById("wchip"), pop = document.getElementById("wpop"); if(!chip) return;
+    const c = j.current, d = j.daily;
+    const wet = (c.weather_code >= 51 && c.weather_code <= 82) || c.precipitation > 0;
+    chip.innerHTML = `${icon(c.weather_code, c.is_day, 24)}<span>${deg(c.temperature_2m)}</span>`;
+    chip.setAttribute("aria-label", `Vädret i Eggebyberg: ${deg(c.temperature_2m)}, ${TEXT(c.weather_code).toLowerCase()}. Visa mer`);
+    pop.innerHTML = `
+      <div class="wp-head">${icon(c.weather_code, c.is_day, 40)}<div><b>${deg(c.temperature_2m)} ${TEXT(c.weather_code).toLowerCase()}</b><span>${PLACE}</span></div></div>
+      <p class="wp-quip">${quip(c)}</p>
+      <dl class="wp-list">
+        <dt>Känns som</dt><dd>${deg(c.apparent_temperature)}</dd>
+        <dt>Vind</dt><dd>${Math.round(c.wind_speed_10m)} m/s${c.wind_gusts_10m >= c.wind_speed_10m + 3 ? ` (byar ${Math.round(c.wind_gusts_10m)})` : ""}</dd>
+        <dt>I dag</dt><dd>${deg(d.temperature_2m_min[0])} till ${deg(d.temperature_2m_max[0])}</dd>
+        <dt>Sol</dt><dd>upp ${hm(d.sunrise[0])}, ner ${hm(d.sunset[0])}</dd>
+        <dt>Täcke</dt><dd>${blanket(c.apparent_temperature, wet)}</dd>
+      </dl>
+      <a class="wp-src" href="https://open-meteo.com/" target="_blank" rel="noopener">Väder från Open-Meteo.com</a>`;
+    chip.hidden = false;
+  }
+
+  async function load(force){
+    let cached = null;
+    try{ cached = JSON.parse(localStorage.getItem(CACHE) || "null"); }catch(_){}
+    if(cached && cached.data){ render(cached.data); if(!force && Date.now() - cached.at < MAX_AGE) return; }
+    try{
+      const r = await fetch(URL_);
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      if(!j.current) throw new Error("tomt svar");
+      try{ localStorage.setItem(CACHE, JSON.stringify({at: Date.now(), data: j})); }catch(_){}
+      render(j);
+    }catch(_){
+      if(!cached){ const chip = document.getElementById("wchip"); if(chip) chip.hidden = true; }
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    const header = document.querySelector(".wrap header.top"); if(!header) return;
+    const wrap = document.createElement("div"); wrap.className = "wbox";
+    wrap.innerHTML = '<button type="button" class="wchip" id="wchip" hidden aria-expanded="false" aria-controls="wpop"></button><div class="wpop" id="wpop" hidden role="dialog" aria-label="Vädret i Eggebyberg"></div>';
+    header.appendChild(wrap);
+    const chip = wrap.querySelector("#wchip"), pop = wrap.querySelector("#wpop");
+    const close = () => { pop.hidden = true; chip.setAttribute("aria-expanded", "false"); };
+    chip.addEventListener("click", e => { e.stopPropagation(); const open = pop.hidden; pop.hidden = !open; chip.setAttribute("aria-expanded", String(open)); });
+    document.addEventListener("click", e => { if(!pop.hidden && !wrap.contains(e.target)) close(); });
+    document.addEventListener("keydown", e => { if(e.key === "Escape") close(); });
+    load(false);
+    setInterval(() => { if(document.visibilityState === "visible") load(false); }, 10 * 60 * 1000);
+    document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible") load(false); });
+  });
+})();
+
+</script>
 </head>
 <body>
 <title>Stallboken Eggebyberg</title>
@@ -1934,6 +2059,28 @@ body.admin-open{overflow:hidden}
 .fasave{display:flex;align-items:center;gap:10px}
 .fasave .hint{color:var(--free);font-weight:600}
 @media (max-width:640px){.faslots li,.faadd{grid-template-columns:1fr 1fr}.faslots li .fsacts,.faadd .btn{grid-column:1/-1;justify-self:start}}
+/* vädret: liten bricka i sidhuvudet */
+.wbox{position:relative;flex:0 0 auto;align-self:flex-start}
+.wchip{display:inline-flex;align-items:center;gap:4px;border:1.5px solid var(--rope);background:var(--surface);border-radius:999px;padding:3px 10px 3px 6px;font-weight:700;font-size:15px;color:var(--leather);line-height:1}
+.wchip:hover{border-color:var(--pine)}
+.wchip[hidden]{display:none!important}
+.wpop{position:absolute;right:0;top:calc(100% + 8px);z-index:20;width:min(290px,calc(100vw - 32px));background:var(--surface);border:2px solid var(--rope);border-radius:10px;box-shadow:5px 5px 0 rgba(94,58,34,.2);padding:14px;display:flex;flex-direction:column;gap:8px}
+.wpop[hidden]{display:none!important}
+.wp-head{display:flex;align-items:center;gap:10px}
+.wp-head b{display:block;font-family:var(--display);font-size:17px;color:var(--leather)}
+.wp-head span{font-size:12.5px;color:var(--muted)}
+.wp-quip{margin:0;font-weight:700;color:var(--pine);font-size:14px}
+.wp-list{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0;font-size:13.5px}
+.wp-list dt{color:var(--muted)}
+.wp-list dd{margin:0}
+.wp-src{font-size:11px;color:var(--muted);text-decoration:none;align-self:flex-end}
+@media (max-width:640px){
+  body.authed header.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center}
+  body.authed header.top .brand{grid-column:1;min-width:0}
+  body.authed header.top .wbox{grid-column:2;grid-row:1;align-self:center}
+  body.authed header.top .hactions{grid-column:1 / -1}
+}
+
 .flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
 @media (max-width:640px){
   .member{grid-template-columns:42px minmax(0,1fr)}
