@@ -940,10 +940,10 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    const header = document.querySelector(".wrap header.top"); if(!header) return;
+    const mebar = document.querySelector(".wrap header.top .mebar"); if(!mebar) return;
     const wrap = document.createElement("div"); wrap.className = "wbox";
     wrap.innerHTML = '<button type="button" class="wchip" id="wchip" hidden aria-expanded="false" aria-controls="wpop"></button><div class="wpop" id="wpop" hidden role="dialog" aria-label="Vädret i Eggebyberg"></div>';
-    header.appendChild(wrap);
+    mebar.after(wrap);
     const chip = wrap.querySelector("#wchip"), pop = wrap.querySelector("#wpop");
     const close = () => { pop.hidden = true; chip.setAttribute("aria-expanded", "false"); };
     chip.addEventListener("click", e => { e.stopPropagation(); const open = pop.hidden; pop.hidden = !open; chip.setAttribute("aria-expanded", String(open)); });
@@ -2058,11 +2058,11 @@ body.admin-open{overflow:hidden}
 .fasave .hint{color:var(--free);font-weight:600}
 @media (max-width:640px){.faslots li,.faadd{grid-template-columns:1fr 1fr}.faslots li .fsacts,.faadd .btn{grid-column:1/-1;justify-self:start}}
 /* vädret: liten bricka i sidhuvudet */
-.wbox{position:relative;flex:0 0 auto;align-self:flex-start}
+.wbox{position:relative;flex:0 0 auto;align-self:center}
 .wchip{display:inline-flex;align-items:center;gap:4px;border:1.5px solid var(--rope);background:var(--surface);border-radius:999px;padding:3px 10px 3px 6px;font-weight:700;font-size:15px;color:var(--leather);line-height:1}
 .wchip:hover{border-color:var(--pine)}
 .wchip[hidden]{display:none!important}
-.wpop{position:absolute;right:0;top:calc(100% + 8px);z-index:20;width:min(290px,calc(100vw - 32px));background:var(--surface);border:2px solid var(--rope);border-radius:10px;box-shadow:5px 5px 0 rgba(94,58,34,.2);padding:14px;display:flex;flex-direction:column;gap:8px}
+.wpop{position:absolute;left:0;top:calc(100% + 8px);z-index:20;width:min(290px,calc(100vw - 32px));background:var(--surface);border:2px solid var(--rope);border-radius:10px;box-shadow:5px 5px 0 rgba(94,58,34,.2);padding:14px;display:flex;flex-direction:column;gap:8px}
 .wpop[hidden]{display:none!important}
 .wp-head{display:flex;align-items:center;gap:10px}
 .wp-head b{display:block;font-family:var(--display);font-size:17px;color:var(--leather)}
@@ -2073,11 +2073,18 @@ body.admin-open{overflow:hidden}
 .wp-list dd{margin:0}
 .wp-src{font-size:11px;color:var(--muted);text-decoration:none;align-self:flex-end}
 @media (max-width:640px){
-  body.authed header.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center}
-  body.authed header.top .brand{grid-column:1;min-width:0}
-  body.authed header.top .wbox{grid-column:2;grid-row:1;align-self:center}
-  body.authed header.top .hactions{grid-column:1 / -1}
+  .hactions .mebar{margin-right:0;flex:0 1 auto}
+  .hactions .wbox{margin-right:auto}
+  body.authed .hactions .btn{white-space:nowrap;padding:6px 10px;font-size:12.5px;min-height:34px}
+  .wchip{padding:2px 8px 2px 5px;font-size:14px}
+  .wchip svg{width:20px;height:20px}
+  .wpop{left:-60px}
 }
+@media (max-width:380px){
+  body.authed .hactions{gap:5px}
+  body.authed .hactions .btn{padding:6px 8px}
+}
+
 
 .flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
 @media (max-width:640px){
