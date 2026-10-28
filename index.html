@@ -1,0 +1,1478 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f1e3c8">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ctext x='50%25' y='54%25' font-size='52' text-anchor='middle' dominant-baseline='middle' fill='%23b0502a'%3E%E2%98%85%3C/text%3E%3C/svg%3E">
+<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui}img{max-width:100%}[hidden]{display:none!important}</style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"></script>
+<script>
+/* Stallboken Eggebyberg – koppling till Supabase.
+   Översätter appens lagring (collection/doc/onSnapshot) till Supabase-tabellerna,
+   och sköter inloggning, inbjudan och lösenord. */
+(function(){
+  const SUPABASE_URL = "https://zvusbfxfguyvpxbghvhk.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_tzpI16W68KvspONhVd4yqw_KYlYTAhi";
+
+  /* Läs av inbjudnings-/återställningslänken innan klienten städar bort den ur adressen */
+  const startHash = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const startQuery = new URLSearchParams(location.search);
+  let linkType = startHash.get("type") || startQuery.get("type") || "";
+  /* kom ihåg att lösenord ska väljas, även om sidan laddas om mitt i */
+  try{
+    if(linkType === "invite" || linkType === "recovery") sessionStorage.setItem("stall-needpw", linkType);
+    else linkType = sessionStorage.getItem("stall-needpw") || "";
+  }catch(_){}
+  const linkError = startHash.get("error_description") || startQuery.get("error_description") || "";
+
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "implicit" }
+  });
+  window.__sb = sb;
+
+  /* ---------- fel ---------- */
+  function mapErr(e){
+    if(!e) return {code:"unavailable", message:"Okänt fel"};
+    const c = e.code || "";
+    if(c === "23P01") return {code:"booking_clash", message:e.message};
+    if(c === "PGRST301" || c === "42501" || e.status === 401) return {code:"signed_out", message:e.message};
+    return {code:"unavailable", message:e.message || String(e)};
+  }
+  const must = r => { if(r.error) throw mapErr(r.error); return r.data; };
+
+  /* ---------- tabeller: appens fält <-> kolumner ---------- */
+  const hhmm = t => (t || "").slice(0,5);
+  const T = {
+    horses: {
+      table: "horses",
+      from: r => ({name:r.name, riders:r.riders || []}),
+      to:   d => pick({name:d.name, riders:d.riders}),
+      order: {name:"name"}
+    },
+    bookings: {
+      table: "bookings",
+      from: r => ({horseId:r.horse_id, date:r.date, start:hhmm(r.start_time), end:hhmm(r.end_time), rider:r.rider, note:r.note || "", createdAt:r.created_at}),
+      to:   d => pick({horse_id:d.horseId, date:d.date, start_time:d.start, end_time:d.end, rider:d.rider, note:d.note}),
+      order: {createdAt:"created_at", date:"date"}
+    },
+    notes: {
+      table: "notes",
+      from: r => ({text:r.text, author:r.author, photo:r.photo, pinned:r.pinned, pinnedAt:r.pinned_at, createdAt:r.created_at}),
+      to:   d => pick({text:d.text, author:d.author, photo:d.photo, pinned:d.pinned, pinned_at:d.pinnedAt}),
+      order: {createdAt:"created_at"}
+    },
+    chat: {
+      table: "chat",
+      from: r => ({text:r.text, author:r.author, photo:r.photo, createdAt:r.created_at}),
+      to:   d => pick({text:d.text, author:d.author, photo:d.photo}),
+      order: {createdAt:"created_at"}
+    }
+  };
+  function pick(o){ const r={}; for(const k in o) if(o[k]!==undefined) r[k]=o[k]; return r; }
+
+  /* ---------- direktuppdatering: en kanal per tabell, alla lyssnare hämtar om ---------- */
+  const watchers = {};
+  function watch(table, fn){
+    if(!watchers[table]){
+      const set = new Set(); let timer = null;
+      const fire = () => { clearTimeout(timer); timer = setTimeout(() => set.forEach(f => f()), 120); };
+      sb.channel("rt-" + table)
+        .on("postgres_changes", {event:"*", schema:"public", table}, fire)
+        .subscribe();
+      watchers[table] = {set, fire};
+    }
+    watchers[table].set.add(fn);
+    return () => watchers[table].set.delete(fn);
+  }
+  const bump = table => watchers[table] && watchers[table].fire();
+  /* om fliken legat i bakgrunden: hämta om allt när man kommer tillbaka */
+  document.addEventListener("visibilitychange", () => {
+    if(document.visibilityState === "visible") Object.values(watchers).forEach(w => w.fire());
+  });
+
+  const snapDoc = (id, data) => ({id, exists: !!data, data: () => data, metadata:{fromCache:false, hasPendingWrites:false}});
+  const qSnap = docs => ({docs, size:docs.length, empty:!docs.length, docChanges:() => [], metadata:{fromCache:false, hasPendingWrites:false}});
+  const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)));
+
+  /* ---------- vanliga tabeller ---------- */
+  function tableQuery(def, q){
+    async function run(){
+      let req = sb.from(def.table).select("*");
+      if(q.order){ const col = def.order[q.order.f] || q.order.f; req = req.order(col, {ascending: q.order.dir !== "desc"}); }
+      if(q.lim) req = req.limit(q.lim);
+      const rows = must(await req);
+      return qSnap(rows.map(r => snapDoc(r.id, def.from(r))));
+    }
+    return {
+      where(){ return tableQuery(def, q); },
+      orderBy(f, dir){ return tableQuery(def, {...q, order:{f, dir}}); },
+      limit(n){ return tableQuery(def, {...q, lim:n}); },
+      get: run,
+      onSnapshot(next, onErr){
+        let alive = true;
+        const go = () => run().then(s => { if(alive) next(s); }).catch(e => { if(alive && onErr && e.code === "signed_out") onErr(e); });
+        go();
+        const un = watch(def.table, go);
+        return () => { alive = false; un(); };
+      },
+      doc(id){ return tableDoc(def, id || uuid()); },
+      async add(d){ const id = uuid(); await tableDoc(def, id).set(d); return tableDoc(def, id); }
+    };
+  }
+  function tableDoc(def, id){
+    return {
+      id,
+      async get(){ const r = must(await sb.from(def.table).select("*").eq("id", id).maybeSingle()); return snapDoc(id, r ? def.from(r) : undefined); },
+      async set(d){ must(await sb.from(def.table).upsert({id, ...def.to(d)})); bump(def.table); },
+      async update(d){ must(await sb.from(def.table).update(def.to(d)).eq("id", id)); bump(def.table); },
+      async delete(){ must(await sb.from(def.table).delete().eq("id", id)); bump(def.table); },
+      onSnapshot(next){ let alive = true; const go = () => this.get().then(s => alive && next(s)).catch(()=>{}); go(); const un = watch(def.table, go); return () => { alive = false; un(); }; }
+    };
+  }
+
+  /* ---------- avbockat: id = "ÅÅÅÅ-MM-DD_pass" ---------- */
+  const splitCheck = id => ({date:id.slice(0,10), slot:id.slice(11)});
+  const checks = {
+    onSnapshot(next){
+      let alive = true;
+      const go = async () => {
+        try{
+          const rows = must(await sb.from("checks").select("*"));
+          if(alive) next(qSnap(rows.map(r => snapDoc(r.date + "_" + r.slot, {date:r.date, slot:r.slot, by:r.done_by, at:r.done_at}))));
+        }catch(_){}
+      };
+      go(); const un = watch("checks", go);
+      return () => { alive = false; un(); };
+    },
+    doc(id){
+      const k = splitCheck(id);
+      return {
+        id,
+        async set(d){ must(await sb.from("checks").upsert({date:k.date, slot:k.slot, done_by:d.by, done_at:d.at || new Date().toISOString()})); bump("checks"); },
+        async delete(){ must(await sb.from("checks").delete().eq("date", k.date).eq("slot", k.slot)); bump("checks"); }
+      };
+    }
+  };
+
+  /* ---------- sysslelistan (appen ser den som ett dokument config/chores) ---------- */
+  const choresDoc = {
+    async get(){
+      const rows = must(await sb.from("chores").select("*").order("sort"));
+      return snapDoc("chores", {list: rows.map(r => ({id:r.id, name:r.name}))});
+    },
+    onSnapshot(next){
+      let alive = true;
+      const go = () => this.get().then(s => alive && next(s)).catch(()=>{});
+      go(); const un = watch("chores", go);
+      return () => { alive = false; un(); };
+    },
+    async set(d){
+      const list = (d.list || []).map((c, i) => ({id:c.id, name:c.name, sort:i + 1}));
+      const existing = must(await sb.from("chores").select("id")).map(r => r.id);
+      const keep = new Set(list.map(c => c.id));
+      const gone = existing.filter(id => !keep.has(id));
+      if(list.length) must(await sb.from("chores").upsert(list));
+      if(gone.length) must(await sb.from("chores").delete().in("id", gone));
+      bump("chores");
+    }
+  };
+
+  /* ---------- foton i lagringen 'photos' ---------- */
+  const urlCache = new Map();
+  function dataUrlToBlob(u){
+    const [head, b64] = u.split(","); const mime = (head.match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
+    for(let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], {type:mime});
+  }
+  const photos = {
+    async add(d){
+      const path = new Date().toISOString().slice(0,7) + "/" + uuid() + ".jpg";
+      const up = await sb.storage.from("photos").upload(path, dataUrlToBlob(d.data), {contentType:"image/jpeg", upsert:false});
+      if(up.error) throw mapErr(up.error);
+      return {id: path};
+    },
+    doc(path){
+      return {
+        id: path,
+        async get(){
+          if(urlCache.has(path)) return snapDoc(path, {data: urlCache.get(path)});
+          const r = await sb.storage.from("photos").createSignedUrl(path, 60 * 60 * 24);
+          if(r.error || !r.data) return snapDoc(path, undefined);
+          urlCache.set(path, r.data.signedUrl);
+          return snapDoc(path, {data: r.data.signedUrl});
+        },
+        async delete(){ await sb.storage.from("photos").remove([path]); urlCache.delete(path); }
+      };
+    }
+  };
+
+  /* ---------- appens databasgränssnitt ---------- */
+  const db = {
+    collection(path){
+      if(path === "feeding") return checks;
+      if(path === "photos") return photos;
+      const def = T[path];
+      if(!def) throw new TypeError("Okänd samling: " + path);
+      return tableQuery(def, {});
+    },
+    doc(path){
+      if(path === "config/chores") return choresDoc;
+      const i = path.lastIndexOf("/");
+      return db.collection(path.slice(0, i)).doc(path.slice(i + 1));
+    }
+  };
+
+  /* ---------- inloggning ---------- */
+  let resolveReady; const ready = new Promise(r => resolveReady = r);
+  let me = null;   // {id, email, name, is_admin}
+
+  window.claude = {
+    use: async name => {
+      if(name === "db"){ await ready; return db; }
+      if(name === "user") return {can: async () => true, isOwner: () => !!(me && me.is_admin), canEdit: () => !!(me && me.is_admin)};
+      return null;
+    }
+  };
+
+  const $ = id => document.getElementById(id);
+  function show(view){
+    document.body.classList.toggle("authed", view === "app");
+    $("auth").hidden = view === "app";
+    ["login","forgot","setpw","sent","loading"].forEach(v => { const el = $("auth-" + v); if(el) el.hidden = v !== view; });
+    if(view !== "app"){ const f = $("auth-" + view); const i = f && f.querySelector("input"); if(i) setTimeout(() => i.focus(), 50); }
+  }
+  function authErr(form, msg){ const p = $(form + "-err"); p.textContent = msg; p.hidden = !msg; }
+  function busy(btn, on, label){ btn.disabled = on; if(label) btn.textContent = label; }
+
+  async function loadMe(session){
+    const u = session.user;
+    const r = await sb.from("profiles").select("*").eq("id", u.id).maybeSingle();
+    me = r.data || {id:u.id, email:u.email, name:(u.user_metadata && u.user_metadata.name) || "", is_admin:false};
+    if(!me.email) me.email = u.email;
+    return me;
+  }
+
+  function enterApp(){
+    const name = me.name || (me.email || "").split("@")[0];
+    try{ localStorage.setItem("stallboken-name", name); }catch(_){}
+    ["fWho","nWho","cWho"].forEach(id => { const el = $(id); if(el) el.value = name; });
+    $("meName").textContent = name;
+    $("inviteBtn").hidden = !me.is_admin;
+    show("app");
+    resolveReady();
+  }
+
+  let entered = false, inSetPw = false;
+  async function handleSession(session, evt){
+    if(!session){ entered = false; show("login"); return; }
+    await loadMe(session);
+    if(linkType === "invite" || linkType === "recovery" || evt === "PASSWORD_RECOVERY"){
+      if(!inSetPw){
+        inSetPw = true;
+        $("setpw-title").textContent = linkType === "invite" ? "Välkommen till Stallboken!" : "Välj ett nytt lösenord";
+        $("setpw-lead").textContent = linkType === "invite" ? "Skriv ditt namn och välj ett lösenord. Sedan loggar du in med din e-post och lösenordet." : "Skriv ditt nya lösenord två gånger.";
+        $("sp-name-wrap").hidden = linkType !== "invite";
+        $("sp-name").value = me.name || "";
+        show("setpw");
+      }
+      return;
+    }
+    if(!entered){ entered = true; enterApp(); }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    show("loading");
+    if(linkError){ show("login"); authErr("login", "Länken fungerar inte längre. Den kan ha använts redan eller gått ut. Be om en ny inbjudan, eller använd Glömt lösenord."); }
+
+    sb.auth.onAuthStateChange((evt, session) => {
+      if(evt === "SIGNED_OUT"){ location.replace(location.pathname); return; }
+      if(evt === "INITIAL_SESSION" || evt === "SIGNED_IN" || evt === "PASSWORD_RECOVERY"){
+        setTimeout(() => handleSession(session, evt), 0);
+      }
+    });
+
+    /* logga in */
+    $("auth-login").addEventListener("submit", async e => {
+      e.preventDefault(); authErr("login", "");
+      const btn = $("li-btn"); busy(btn, true, "Loggar in…");
+      const {error} = await sb.auth.signInWithPassword({email:$("li-email").value.trim(), password:$("li-pw").value});
+      busy(btn, false, "Logga in");
+      if(error) authErr("login", /invalid/i.test(error.message) ? "Fel e-post eller lösenord." : "Det gick inte att logga in just nu. Försök igen om en stund.");
+    });
+    $("li-forgot").onclick = () => { $("fg-email").value = $("li-email").value; authErr("forgot", ""); show("forgot"); };
+    $("fg-back").onclick = () => show("login");
+    $("sent-back").onclick = () => show("login");
+
+    /* glömt lösenord */
+    $("auth-forgot").addEventListener("submit", async e => {
+      e.preventDefault(); authErr("forgot", "");
+      const btn = $("fg-btn"); busy(btn, true, "Skickar…");
+      const {error} = await sb.auth.resetPasswordForEmail($("fg-email").value.trim(), {redirectTo: location.origin + location.pathname});
+      busy(btn, false, "Skicka länk");
+      if(error && /rate|limit/i.test(error.message)) return authErr("forgot", "Det har skickats för många mejl. Vänta en stund och försök igen.");
+      $("sent-to").textContent = $("fg-email").value.trim();
+      show("sent");
+    });
+
+    /* välj lösenord (inbjudan eller återställning) */
+    $("auth-setpw").addEventListener("submit", async e => {
+      e.preventDefault(); authErr("setpw", "");
+      const pw = $("sp-pw").value, pw2 = $("sp-pw2").value, name = $("sp-name").value.trim();
+      if(!$("sp-name-wrap").hidden && !name) return authErr("setpw", "Skriv ditt namn, så vet alla vem som bokar.");
+      if(pw.length < 8) return authErr("setpw", "Lösenordet behöver vara minst 8 tecken.");
+      if(pw !== pw2) return authErr("setpw", "Lösenorden är inte likadana. Skriv samma två gånger.");
+      const btn = $("sp-btn"); busy(btn, true, "Sparar…");
+      const upd = await sb.auth.updateUser({password:pw, data: name ? {name} : undefined});
+      if(upd.error){ busy(btn, false, "Spara och gå in"); return authErr("setpw", /same|different/i.test(upd.error.message) ? "Välj ett annat lösenord än det gamla." : "Det gick inte att spara lösenordet. Försök igen."); }
+      if(name){ await sb.from("profiles").update({name}).eq("id", me.id); me.name = name; }
+      history.replaceState(null, "", location.pathname);
+      try{ sessionStorage.removeItem("stall-needpw"); }catch(_){}
+      linkType = "";
+      inSetPw = false; entered = true; enterApp();
+    });
+
+    /* logga ut */
+    $("logoutBtn").onclick = async () => { await sb.auth.signOut(); };
+
+    /* ---------- admin: bjud in och hantera ryttare ---------- */
+    async function loadMembers(){
+      const list = $("inv-list");
+      const r = await sb.from("profiles").select("id,name,email,is_admin,created_at").order("created_at");
+      if(r.error){ list.innerHTML = '<li class="inv-empty">Kunde inte hämta listan.</li>'; return; }
+      list.innerHTML = r.data.map(p => `<li><span class="n"><b>${esc(p.name || "(inget namn än)")}</b><span>${esc(p.email || "")}${p.is_admin ? " · admin" : ""}</span></span>${p.id === me.id || p.is_admin ? "" : `<button class="btn small" type="button" data-rm="${p.id}" data-name="${esc(p.name || p.email)}">Ta bort</button>`}</li>`).join("");
+    }
+    const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    async function callAdmin(body){
+      const {data, error} = await sb.functions.invoke("invite", {body});
+      if(error){
+        let msg = "Det gick inte. Försök igen om en stund.";
+        try{ const j = await error.context.json(); if(j && j.error) msg = j.error; }catch(_){}
+        throw new Error(msg);
+      }
+      return data;
+    }
+    $("inviteBtn").onclick = () => { $("inv-err").hidden = true; $("inv-ok").hidden = true; $("inv-email").value = ""; $("inv-name").value = ""; loadMembers(); $("inviteDlg").showModal(); };
+    $("inv-close").onclick = () => $("inviteDlg").close();
+    $("inv-form").addEventListener("submit", async e => {
+      e.preventDefault();
+      const email = $("inv-email").value.trim(), name = $("inv-name").value.trim();
+      $("inv-err").hidden = true; $("inv-ok").hidden = true;
+      const btn = $("inv-btn"); busy(btn, true, "Skickar…");
+      try{
+        await callAdmin({action:"invite", email, name, redirectTo: location.origin + location.pathname});
+        $("inv-ok").textContent = `Inbjudan är skickad till ${email}.`; $("inv-ok").hidden = false;
+        $("inv-email").value = ""; $("inv-name").value = ""; loadMembers();
+      }catch(x){ $("inv-err").textContent = x.message; $("inv-err").hidden = false; }
+      busy(btn, false, "Skicka inbjudan");
+    });
+    $("inv-list").addEventListener("click", async e => {
+      const b = e.target.closest("button[data-rm]"); if(!b) return;
+      if(b.dataset.sure !== "1"){ b.dataset.sure = "1"; b.textContent = "Säker? Tryck igen"; b.classList.add("danger"); return; }
+      b.disabled = true;
+      try{ await callAdmin({action:"remove", userId:b.dataset.rm}); loadMembers(); }
+      catch(x){ $("inv-err").textContent = x.message; $("inv-err").hidden = false; b.disabled = false; }
+    });
+  });
+})();
+
+</script>
+</head>
+<body>
+<title>Stallboken Eggebyberg</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rye&family=Arvo:wght@400;700&family=Libre+Franklin:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: frontier ranch board — sun-bleached paper on desert sand, rust and saddle-leather ink, woodtype headline, rope-stitched cards with hard print shadows */
+:root{
+  --bg:#f1e3c8; --surface:#fdf6e8; --surface-2:#f4e7cd; --line:#dcc29a; color-scheme:light;
+  --fg:#3a2416; --muted:#7d5d40;
+  --pine:#b0502a; --pine-ink:#fff7ea; --brass:#b0502a;
+  --leather:#5e3a22; --rope:#c9a676;
+  --tint:#f3d8bd; --shadow:4px 4px 0 rgba(94,58,34,.14);
+  --free:#5d7a37; --free-bg:#e6e9c9; --busy:#a3301f; --busy-bg:#f6d8c9;
+  --block:#b0502a; --block-mine:#e2a982;
+  --pin:#8a560e; --pin-bg:#f8e6b6; --pin-line:#e2c27a;
+  --display:"Arvo",Rockwell,"Roboto Slab",Georgia,serif;
+  --wood:"Rye","Arvo",Rockwell,Georgia,serif;
+  --body:"Libre Franklin",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  --r:8px;
+}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.5}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:16px;padding-block:28px 56px;display:flex;flex-direction:column;gap:24px}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--pine);outline-offset:2px}
+
+header.top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px}
+.brand h1{font-family:var(--display);font-weight:600;font-size:clamp(26px,4.6vw,36px);line-height:1.1;margin:0;letter-spacing:-.02em;text-wrap:balance}
+.brand h1::before{content:"";display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--pine);margin-right:12px;vertical-align:.2em}
+.brand p{margin:4px 0 0 22px;color:var(--muted)}
+.btn{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:8px 14px;font-weight:600;font-size:14px}
+.btn:hover{border-color:var(--pine)}
+.btn.primary{background:var(--pine);color:var(--pine-ink);border-color:var(--pine)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:var(--busy);border-color:var(--busy)}
+.btn.small{padding:5px 11px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* date strip */
+.days{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.calhead{display:flex;align-items:center;gap:8px}
+.calhead .mtitle{font-family:var(--display);font-weight:600;font-size:24px;margin:0;flex:1;text-align:center;order:0}
+.calhead .nav{width:38px;height:38px;padding:0;border-radius:10px}
+.cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.wd{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;text-align:center;padding-block:2px 4px}
+.cday{border:1px solid var(--line);background:var(--bg);border-radius:8px;min-height:68px;padding:6px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:4px;text-align:left;min-width:0}
+.cday:hover{border-color:var(--pine)}
+.cday.out{opacity:.45}
+.cday .dnum{font-family:var(--display);font-size:19px;line-height:1}
+.cday.today .dnum{color:var(--brass)}
+.cday.today{border-color:var(--brass)}
+.cday .cnt{font-size:11.5px;font-weight:700;background:var(--surface-2);border-radius:999px;padding:1px 7px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.fdots{display:flex;gap:3px}
+.fdots i{width:8px;height:8px;border-radius:50%;border:1.5px solid var(--muted);display:block}
+.fdots i.on{background:var(--free);border-color:var(--free)}
+.cday[aria-pressed="true"]{background:var(--pine);border-color:var(--pine);color:var(--pine-ink)}
+.cday[aria-pressed="true"] .dnum{color:inherit}
+.cday[aria-pressed="true"] .cnt{background:var(--pine-ink);color:var(--pine)}
+.cday[aria-pressed="true"] .fdots i{border-color:var(--pine-ink)}
+.cday[aria-pressed="true"] .fdots i.on{background:var(--pine-ink)}
+@media (max-width:520px){.cday{min-height:52px;padding:5px;border-radius:6px}.cday .cl{display:none}.cday .dnum{font-size:16px}.days{padding:10px}.fdots i{width:6px;height:6px}}
+
+.summary{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;color:var(--muted)}
+.summary strong{color:var(--fg)}
+.legend{display:flex;gap:14px;align-items:center;font-size:13px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+
+/* horse cards */
+.board{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr));gap:14px}
+.horse{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.horse.busy{border-color:var(--busy)}
+.hhead{display:flex;justify-content:space-between;align-items:start;gap:10px}
+.plate{min-width:0;display:flex;align-items:center;gap:12px}
+.plate::before{content:attr(data-i);flex:0 0 auto;width:42px;height:42px;border-radius:50%;background:var(--tint);color:var(--pine);display:grid;place-items:center;font-family:var(--display);font-weight:600;font-size:18px}
+.plate .lbl{display:none}
+.plate h2{font-family:var(--display);font-weight:600;font-size:22px;line-height:1.15;margin:0;letter-spacing:-.01em;overflow-wrap:anywhere}
+.pill{flex:0 0 auto;font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;white-space:nowrap}
+.pill.free{background:var(--free-bg);color:var(--free)}
+.pill.busy{background:var(--busy-bg);color:var(--busy)}
+.pill.some{background:var(--surface-2);color:var(--fg)}
+.riders{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-size:12.5px;background:var(--surface-2);border-radius:999px;padding:3px 10px}
+.chip.none{background:none;color:var(--muted);padding-left:0}
+
+.timeline{position:relative;height:30px;background:var(--surface-2);border-radius:6px;overflow:hidden}
+.timeline .tick{position:absolute;top:0;bottom:0;width:1px;background:var(--line)}
+.timeline .blk{position:absolute;top:4px;bottom:4px;background:var(--block);border-radius:4px;opacity:.9}
+.timeline .now{position:absolute;top:0;bottom:0;width:2px;background:var(--busy)}
+.tlabels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:3px}
+
+.blist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.blist li{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;background:var(--surface-2)}
+.blist li.live{background:var(--busy-bg)}
+.blist .time{font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.blist .who{min-width:0}
+.blist .who b{display:block;font-weight:600}
+.blist .who span{display:block;font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.confirm{display:flex;gap:6px;align-items:center;font-size:13px}
+.emptyday{color:var(--muted);font-size:14px;margin:0}
+.hfoot{display:flex;justify-content:flex-end}
+
+.empty{background:var(--surface);border:1px dashed var(--line);border-radius:8px;padding:32px 20px;text-align:center;display:flex;flex-direction:column;gap:10px;align-items:center}
+.empty h2{font-family:var(--display);font-weight:600;font-size:26px;margin:0}
+.empty p{margin:0;color:var(--muted);max-width:48ch}
+.notice{background:var(--busy-bg);color:var(--busy);border-radius:var(--r);padding:10px 14px;font-weight:500}
+.ro{background:var(--surface-2);border-radius:var(--r);padding:10px 14px;color:var(--muted)}
+
+/* dialogs */
+dialog{border:none;border-radius:16px;padding:0;background:var(--surface);color:var(--fg);width:min(460px,calc(100vw - 32px));max-height:calc(100dvh - 32px)}
+dialog::backdrop{background:rgba(10,20,14,.5)}
+.sheet{padding:20px;display:flex;flex-direction:column;gap:14px}
+.sheet h3{font-family:var(--display);font-weight:600;font-size:24px;margin:0}
+.sheet .sub{color:var(--muted);margin-top:-8px}
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--muted)}
+.field input,.field select,.field textarea{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.err{color:var(--busy);font-size:14px;margin:0}
+.manage-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px;max-height:40vh;overflow:auto}
+.manage-list li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:var(--surface-2);border-radius:8px}
+.manage-list .n{min-width:0}
+.manage-list .n b{display:block}
+.manage-list .n span{font-size:12.5px;color:var(--muted)}
+.hint{font-size:12.5px;color:var(--muted);margin:0}
+.notebook{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:20px;display:flex;flex-direction:column;gap:16px}
+.nbhead h2{font-family:var(--display);font-weight:600;font-size:28px;margin:0}
+.nbhead p{margin:4px 0 0;color:var(--muted);max-width:65ch}
+.nform{display:flex;flex-direction:column;gap:10px}
+.nform textarea{resize:vertical;min-height:72px}
+.nrow{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+.nrow .field{flex:1 1 200px}
+.notes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+.note{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:12px 0;border-top:1px solid var(--line)}
+.note .meta{font-size:12.5px;color:var(--muted);font-family:var(--mono)}
+.note .meta b{font-family:var(--body);color:var(--brass);font-weight:700}
+.note .txt{grid-column:1/2;white-space:pre-wrap;overflow-wrap:anywhere;max-width:70ch}
+.note .ctl{grid-row:1/3;grid-column:2;align-self:start}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);overflow-x:auto}
+.tabs button{background:none;border:none;border-bottom:3px solid transparent;padding:10px 14px;font-weight:600;color:var(--muted);white-space:nowrap;margin-bottom:-1px}
+.tabs button[aria-selected="true"]{color:var(--fg);border-bottom-color:var(--brass)}
+.tabs button:hover{color:var(--fg)}
+.panel{display:flex;flex-direction:column;gap:20px}
+.panel[hidden]{display:none!important}
+.feed{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+.fslot{display:flex;align-items:center;gap:14px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--bg)}
+.fslot.done{background:var(--free-bg);border-color:var(--free)}
+.fcheck{flex:0 0 auto;width:40px;height:40px;border-radius:10px;border:2px solid var(--line);background:var(--surface);display:grid;place-items:center;font-size:22px;font-weight:700;color:var(--pine-ink)}
+.fslot.done .fcheck{background:var(--free);border-color:var(--free)}
+.fcheck:hover{border-color:var(--pine)}
+.finfo{flex:1;min-width:0}
+.finfo b{display:block;font-size:17px}
+.finfo span{display:block;font-size:13.5px;color:var(--muted)}
+.fslot.done .finfo span{color:var(--free);font-weight:600}
+/* airy surfaces */
+.horse,.notebook,.days,.empty{border:none;border-radius:20px;box-shadow:var(--shadow);background:var(--surface)}
+.horse{padding:20px;gap:14px}
+.horse.busy{box-shadow:var(--shadow),inset 0 0 0 2px var(--busy)}
+.days{padding:18px}
+.cday{border:none;background:var(--surface-2);border-radius:12px}
+.cday:hover{background:var(--tint)}
+.cday.today{box-shadow:inset 0 0 0 2px var(--pine)}
+.timeline{border-radius:999px;height:14px}
+.timeline .blk{top:0;bottom:0;border-radius:999px}
+.timeline .tick{background:var(--surface)}
+.blist li{background:var(--bg);border-radius:12px}
+.tabs{border-bottom:none;background:var(--surface-2);border-radius:999px;padding:4px;align-self:flex-start;max-width:100%}
+.tabs button{border:none;border-radius:999px;margin:0;padding:8px 16px}
+.tabs button[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.fslot{border:none;background:var(--surface-2);border-radius:14px}
+.fslot.done{background:var(--free-bg)}
+.fcheck{border-radius:50%}
+dialog{border-radius:22px}
+.field input,.field select,.field textarea{border-radius:10px;background:var(--surface-2);border-color:transparent}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--pine);background:var(--surface);outline:none}
+/* responsive layout */
+.hactions{display:flex;gap:8px;flex-wrap:wrap}
+.hactions .short{display:none}
+.content{display:flex;flex-direction:column;gap:20px;min-width:0}
+.layout{display:flex;flex-direction:column;gap:20px}
+@media (min-width:980px){
+  .layout{display:grid;grid-template-columns:330px minmax(0,1fr);align-items:start;gap:24px}
+  .layout:has(#days[hidden]){grid-template-columns:minmax(0,1fr)}
+  .layout:has(#days[hidden]) .side{display:none}
+  .side{position:sticky;top:calc(16px + env(safe-area-inset-top,0px))}
+  .side .cday{min-height:46px;padding:5px}
+  .side .cday .cl{display:none}
+  .side .cday .dnum{font-size:16px}
+  .side .calhead .mtitle{font-size:20px}
+  .side .fdots i{width:6px;height:6px}
+}
+@media (max-width:640px){
+  .wrap{padding-block:16px calc(96px + env(safe-area-inset-bottom,0px));gap:16px}
+  .brand p{display:none}
+  header.top{flex-wrap:nowrap}
+  .brand h1{font-size:22px}
+  .brand h1::before{width:8px;height:8px;margin-right:8px}
+  .hactions .long{display:none}.hactions .short{display:inline}
+  #newBtn{position:fixed;z-index:5;right:16px;bottom:calc(18px + env(safe-area-inset-bottom,0px));padding:14px 22px;font-size:16px;box-shadow:0 6px 20px rgba(74,124,89,.35)}
+  .tabs{align-self:stretch}
+  .tabs button{flex:1 0 auto}
+  body:not([data-tab="bokningar"]) #newBtn{display:none}
+  .msgs{height:calc(100dvh - 268px);min-height:260px;padding:8px}
+  .chat .nbhead p{display:none}
+  .chat .nbhead h2{font-size:22px}
+  .tabs button{padding:9px 8px;font-size:13.5px}
+  .msg{max-width:84%}
+  .btn{min-height:40px}
+  .btn.small{min-height:36px;padding:6px 12px}
+  .field input,.field select,.field textarea{font-size:16px;padding:12px}
+  .horse{padding:16px}
+  .notebook{padding:16px}
+  .summary{font-size:14px}
+  .summary .legend{display:none}
+  dialog{margin:auto 0 0;width:100%;max-width:100%;max-height:92dvh;border-radius:22px 22px 0 0}
+  dialog .sheet{padding-bottom:calc(20px + env(safe-area-inset-bottom,0px))}
+  .actions .btn{flex:1}
+  body .toast{bottom:calc(90px + env(safe-area-inset-bottom,0px))}
+}
+@media (max-width:380px){.blist li{grid-template-columns:1fr auto}.blist .time{grid-column:1/-1}}
+.grp{font-family:var(--display);font-weight:600;font-size:17px;margin:4px 0 0}
+.grphead{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.chores{display:flex;flex-direction:column;gap:12px}
+.progress{margin:0;color:var(--muted)}
+.progress b{color:var(--fg)}
+.addchore{display:flex;gap:10px;align-items:end;flex-wrap:wrap}
+.addchore .field{flex:1 1 200px}
+.cday .cnt.full{background:var(--free-bg);color:var(--free)}
+.cday[aria-pressed="true"] .cnt.full{background:var(--pine-ink);color:var(--free)}
+ /* pinned notes */
+.pinned{background:var(--pin-bg);border:1px solid var(--pin-line);border-radius:20px;padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.pinhead{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.pinlbl{display:inline-flex;align-items:center;gap:6px;color:var(--pin);font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.08em}
+.linkbtn{background:none;border:none;padding:4px 0;color:var(--pin);font-weight:700;font-size:14px}
+.linkbtn:hover{text-decoration:underline}
+.pinlist{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:10px}
+.pinlist li{background:var(--surface);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.ptxt{margin:0;font-weight:600;white-space:pre-wrap;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.pmeta{font-size:12.5px;color:var(--muted)}
+.note.ispinned{background:var(--pin-bg);border-radius:14px;padding-inline:12px;border-top-color:transparent;margin-bottom:6px}
+.ptag{display:inline-flex;align-items:center;gap:4px;color:var(--pin);font-family:var(--body);font-weight:700}
+.nctl{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.btn.pinon{color:var(--pin);border-color:var(--pin-line);background:var(--pin-bg)}
+.btn svg{vertical-align:-2px}
+.pincheck{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14px;padding:8px 0;cursor:pointer}
+.pincheck input{width:18px;height:18px;accent-color:var(--pin)}
+/* chat */
+.tabs .short{display:none}
+@media (max-width:640px){.tabs .long{display:none}.tabs .short{display:inline}}
+.side:has(#days[hidden]){display:none}
+#status:empty{display:none}
+.tabs button{position:relative}
+.badge{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 5px;margin-left:6px;border-radius:999px;background:var(--busy);color:#fff;font-size:11px;font-weight:700;vertical-align:1px}
+.chat{gap:12px}
+.msgs{height:min(60vh,560px);overflow-y:auto;display:flex;flex-direction:column;gap:2px;padding:12px;background:var(--bg);border-radius:16px;overscroll-behavior:contain}
+.chatempty{margin:auto;color:var(--muted)}
+.dsep{display:flex;justify-content:center;margin:12px 0 6px}
+.dsep span{font-size:12px;font-weight:700;color:var(--muted);background:var(--surface-2);border-radius:999px;padding:2px 10px}
+.msg{display:flex;flex-direction:column;align-items:flex-start;max-width:min(78%,520px);margin-top:8px}
+.msg.cont{margin-top:2px}
+.msg.mine{align-self:flex-end;align-items:flex-end}
+.mwho{font-size:12px;font-weight:700;color:var(--pine);margin:0 0 2px 12px}
+.bubble{background:var(--surface);border-radius:18px 18px 18px 6px;padding:8px 12px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 1px 1px rgba(0,0,0,.04)}
+.msg.cont .bubble{border-top-left-radius:6px}
+.msg.mine .bubble{background:var(--pine);color:var(--pine-ink);border-radius:18px 18px 6px 18px}
+.msg.mine.cont .bubble{border-top-right-radius:6px}
+.mtime{font-size:11px;opacity:.6;margin-left:8px;white-space:nowrap;float:right;margin-top:6px}
+.composer{display:flex;flex-direction:column;gap:8px}
+.cwho{max-width:320px}
+.crow{display:flex;gap:8px;align-items:flex-end}
+.crow textarea{flex:1;min-width:0;resize:none;border-radius:22px;background:var(--surface-2);border:1px solid transparent;padding:11px 16px;line-height:1.4;max-height:140px}
+.crow textarea:focus{outline:none;border-color:var(--pine);background:var(--surface)}
+.send{width:46px;height:46px;padding:0;display:grid;place-items:center;flex:0 0 auto}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+/* photos */
+.photobtn{display:inline-flex;align-items:center;gap:6px;cursor:pointer;position:relative}
+.photobtn.icon{width:46px;height:46px;padding:0;justify-content:center;flex:0 0 auto}
+.photoprev{display:flex;align-items:center;gap:10px;background:var(--surface-2);border-radius:14px;padding:8px}
+.photoprev img{width:64px;height:64px;object-fit:cover;border-radius:10px}
+.ptiny{font-size:13px;color:var(--muted);flex:1}
+.photo{display:block;border:none;padding:0;background:var(--surface-2);border-radius:12px;overflow:hidden;cursor:zoom-in;max-width:100%}
+.photo img{display:block;max-width:100%;height:auto;min-height:60px;min-width:80px;object-fit:cover}
+.photo.missing{display:none}
+.pphoto{width:100%}.pphoto img{width:100%;max-height:160px;object-fit:cover}
+.nphoto{margin-top:8px;max-width:min(360px,100%)}
+.nphoto img{max-height:320px}
+.cphoto{margin:-4px -8px 6px;max-width:260px}
+.cphoto img{max-height:300px}
+.bubble.hasphoto{padding-top:8px}
+.photodlg{padding:12px;background:var(--surface);width:auto;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);display:none;flex-direction:column;gap:10px;align-items:flex-end}
+.photodlg[open]{display:flex}
+.photodlg img{max-width:100%;max-height:calc(100dvh - 100px);border-radius:12px;object-fit:contain}
+/* ---- western skin ---- */
+body{background-color:var(--bg);background-image:radial-gradient(rgba(125,93,64,.07) 1px,transparent 1.2px),radial-gradient(rgba(125,93,64,.05) 1px,transparent 1.2px);background-size:22px 22px,13px 13px;background-position:0 0,7px 9px}
+header.top{border-bottom:4px double var(--leather);padding-bottom:16px}
+.brand h1{font-family:var(--wood);font-weight:400;letter-spacing:.02em;color:var(--leather)}
+.brand h1::before{content:"★";width:auto;height:auto;background:none;border-radius:0;color:var(--pine);font-size:.8em;vertical-align:.08em;margin-right:10px}
+.brand p{font-family:var(--display);font-style:italic;margin-left:34px}
+.btn{border-radius:6px;border:1.5px solid var(--rope);background:var(--surface)}
+.btn.primary{text-transform:uppercase;letter-spacing:.06em;font-size:13px;box-shadow:2px 2px 0 var(--leather)}
+.btn.primary:active{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--leather)}
+.horse,.notebook,.days,.empty{border-radius:10px;border:1.5px solid var(--rope);box-shadow:var(--shadow);outline:1.5px dashed var(--rope);outline-offset:-7px;background:var(--surface)}
+.horse.busy{box-shadow:var(--shadow);border-color:var(--busy);outline-color:var(--busy)}
+.plate::before{border-radius:50%;background:var(--pine);color:var(--pine-ink);font-family:var(--wood);font-weight:400;font-size:19px;box-shadow:inset 0 0 0 2px var(--surface),0 0 0 1.5px var(--pine)}
+.plate h2,.nbhead h2,.calhead .mtitle,.grp{font-family:var(--display);font-weight:700;letter-spacing:0}
+.nbhead h2{font-family:var(--wood);font-weight:400;color:var(--leather)}
+.tabs{background:var(--surface-2);border:1.5px solid var(--rope);border-radius:8px}
+.tabs button{border-radius:5px;font-family:var(--display);font-weight:700}
+.tabs button[aria-selected="true"]{background:var(--leather);color:var(--pine-ink);box-shadow:none}
+.cday{border-radius:6px;background:var(--surface-2)}
+.cday[aria-pressed="true"]{background:var(--pine);color:var(--pine-ink)}
+.cday.today{box-shadow:inset 0 0 0 2px var(--leather)}
+.cday.today .dnum{color:var(--pine)}
+.cday[aria-pressed="true"] .dnum{color:var(--pine-ink)}
+.wd{font-family:var(--display)}
+.pill{border-radius:4px;text-transform:uppercase;letter-spacing:.05em;font-size:11px}
+.chip{border-radius:4px;background:var(--tint)}
+.timeline{border-radius:4px;background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--line)}
+.timeline .blk{border-radius:3px}
+.blist li{border-radius:6px;background:var(--surface-2)}
+.pinned{border-radius:10px;border:2px solid var(--pin-line);box-shadow:var(--shadow)}
+
+.pinlist li{border-radius:6px;border:1px solid var(--pin-line)}
+.fslot{border-radius:8px;background:var(--surface-2)}
+.fcheck{border-radius:6px;border-color:var(--rope)}
+.msgs{background:var(--surface-2);border-radius:8px}
+.bubble{border-radius:14px 14px 14px 4px;border:1px solid var(--line)}
+.msg.mine .bubble{border-radius:14px 14px 4px 14px;border-color:var(--pine)}
+.dsep span{font-family:var(--display);background:var(--tint)}
+.field label{color:var(--leather)}
+.field input,.field select,.field textarea,.crow textarea{border-radius:6px;background:var(--surface);border:1.5px solid var(--line)}
+.crow textarea{border-radius:8px}
+dialog{border-radius:12px;border:2px solid var(--rope);box-shadow:6px 6px 0 rgba(94,58,34,.25)}
+.badge{background:var(--pine)}
+.toast{background:var(--leather);color:var(--pine-ink);border-radius:6px}
+@media (max-width:640px){#newBtn{box-shadow:3px 3px 0 var(--leather)}}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:999px;font-weight:600;font-size:14px;z-index:10}
+@media (prefers-reduced-motion:no-preference){.horse{transition:border-color .2s}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <h1>Stallboken Eggebyberg</h1>
+      <p>Boka och avboka hästarna i stallet</p>
+    </div>
+    <div class="hactions">
+      <span class="mebar"><span class="lbl">Inloggad som</span> <b id="meName"></b></span>
+      <button class="btn" id="inviteBtn" type="button" hidden>Bjud in</button>
+      <button class="btn" id="logoutBtn" type="button">Logga ut</button>
+      <button class="btn" id="manageBtn" type="button"><span class="long">Lägg till / ta bort hästar</span><span class="short">Hästar</span></button>
+      <button class="btn primary" id="newBtn" type="button">+ Ny bokning</button>
+    </div>
+  </header>
+
+  <section class="pinned" id="pinned" hidden aria-label="Viktiga anteckningar"></section>
+
+  <div class="tabs" role="tablist" id="tabs">
+    <button type="button" role="tab" data-tab="bokningar" aria-selected="true">Bokningar</button>
+    <button type="button" role="tab" data-tab="fodring" aria-selected="false"><span class="long">Sysslor &amp; fodring</span><span class="short">Sysslor</span></button>
+    <button type="button" role="tab" data-tab="anteckningar" aria-selected="false"><span class="long">Anteckningsbok</span><span class="short">Anteckningar</span></button>
+    <button type="button" role="tab" data-tab="chatt" aria-selected="false">Chatt<span class="badge" id="chatBadge" hidden></span></button>
+  </div>
+
+  <div class="layout">
+  <aside class="side"><nav class="days" id="days" aria-label="Välj dag"></nav></aside>
+  <div class="content">
+  <div id="status"></div>
+
+  <div id="tab-bokningar" class="panel">
+    <div class="summary" id="summary"></div>
+    <main class="board" id="board" aria-live="polite"></main>
+  </div>
+
+  <section id="tab-fodring" class="panel notebook" hidden aria-labelledby="fTitle">
+    <div class="nbhead">
+      <h2 id="fTitle">Sysslor &amp; fodring</h2>
+      <p id="fSub">Bocka i det du har gjort, så ser alla vad som är klart.</p>
+    </div>
+    <div class="field" style="max-width:320px"><label for="fWho">Ditt namn</label><input id="fWho" maxlength="40" placeholder="Vem är i stallet?"></div>
+    <p class="err" id="fErr" hidden></p>
+    <div class="chores" id="feed" aria-live="polite"></div>
+  </section>
+
+  <section class="notebook panel" id="tab-anteckningar" hidden aria-labelledby="nbTitle">
+    <div class="nbhead">
+      <h2 id="nbTitle">Anteckningsboken</h2>
+      <p>Gemensamma anteckningar för stallet: foder, hovslagare, veterinär, sjukdom, beskedet till nästa ryttare.</p>
+    </div>
+    <form id="nForm" class="nform">
+      <div class="field"><label for="nText">Ny anteckning</label><textarea id="nText" rows="3" maxlength="1000" placeholder="t.ex. Bamse har fått ny sko höger fram, skritta bara i dag."></textarea></div>
+      <div class="photoprev" id="nPrev" hidden></div>
+      <div class="nrow">
+        <div class="field"><label for="nWho">Ditt namn</label><input id="nWho" maxlength="40" placeholder="Vem skriver?"></div>
+        <label class="btn photobtn" for="nFile"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg> Lägg till foto<input type="file" id="nFile" accept="image/*" class="sr"></label>
+        <label class="pincheck" for="nPin"><input type="checkbox" id="nPin"> Fäst högst upp</label>
+        <button class="btn primary" type="submit" id="nSave">Spara anteckning</button>
+      </div>
+      <p class="err" id="nErr" hidden></p>
+    </form>
+    <ol class="notes" id="notes"></ol>
+  </section>
+
+  <section class="notebook panel chat" id="tab-chatt" hidden aria-labelledby="cTitle">
+    <div class="nbhead">
+      <h2 id="cTitle">Chatt</h2>
+      <p>Skriv till alla i stallet. Meddelandena syns direkt för alla som har sidan öppen.</p>
+    </div>
+    <div class="msgs" id="msgs" aria-live="polite"></div>
+    <form class="composer" id="chatForm">
+      <div class="field cwho" id="cWhoWrap"><label for="cWho">Ditt namn</label><input id="cWho" maxlength="40" placeholder="Vem skriver?"></div>
+      <div class="photoprev" id="cPrev" hidden></div>
+      <div class="crow">
+        <label class="btn photobtn icon" for="cFile" aria-label="Lägg till foto"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg><input type="file" id="cFile" accept="image/*" class="sr"></label>
+        <label class="sr" for="cText">Meddelande</label>
+        <textarea id="cText" rows="1" maxlength="1000" placeholder="Skriv ett meddelande…"></textarea>
+        <button class="btn primary send" type="submit" id="cSend" aria-label="Skicka"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg></button>
+      </div>
+      <p class="err" id="cErr" hidden></p>
+    </form>
+  </section>
+  </div>
+  </div>
+</div>
+
+<dialog id="bookDlg">
+  <form class="sheet" id="bookForm" method="dialog">
+    <h3>Boka häst</h3>
+    <p class="sub" id="bookSub"></p>
+    <div class="field"><label for="bHorse">Häst</label><select id="bHorse" required></select></div>
+    <div class="field"><label for="bRider">Ryttare</label><select id="bRider"></select></div>
+    <div class="field" id="otherWrap" hidden><label for="bOther">Namn</label><input id="bOther" maxlength="40" placeholder="Vem rider?"></div>
+    <div class="field"><label for="bDate">Datum</label><input id="bDate" type="date" required></div>
+    <div class="row2">
+      <div class="field"><label for="bStart">Från</label><input id="bStart" type="time" step="900" required></div>
+      <div class="field"><label for="bEnd">Till</label><input id="bEnd" type="time" step="900" required></div>
+    </div>
+    <div class="field"><label for="bNote">Notering (valfritt)</label><input id="bNote" maxlength="80" placeholder="t.ex. Dressyrlektion, uteritt"></div>
+    <p class="err" id="bErr" hidden></p>
+    <div class="actions">
+      <button class="btn" type="button" id="bCancel">Avbryt</button>
+      <button class="btn primary" type="submit" id="bSave">Boka</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="photoDlg" class="photodlg"><button class="btn small" type="button" id="photoClose">Stäng</button><img id="photoBig" alt="Foto i full storlek"></dialog>
+
+<dialog id="manageDlg">
+  <div class="sheet">
+    <h3>Hästar &amp; ryttare</h3>
+    <ul class="manage-list" id="mList"></ul>
+    <form id="mForm" style="display:flex;flex-direction:column;gap:10px">
+      <div class="field"><label for="mName">Hästens namn</label><input id="mName" maxlength="40" required placeholder="t.ex. Bamse"></div>
+      <div class="field"><label for="mRiders">Ryttare</label><input id="mRiders" maxlength="200" placeholder="Anna, Ellen, Sara"></div>
+      <p class="hint">Skriv flera ryttare med komma emellan.</p>
+      <p class="err" id="mErr" hidden></p>
+      <div class="actions">
+        <button class="btn" type="button" id="mReset" hidden>Avbryt ändring</button>
+        <button class="btn primary" type="submit" id="mSave">Lägg till häst</button>
+      </div>
+    </form>
+    <div class="actions"><button class="btn" type="button" id="mClose">Stäng</button></div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+
+<script>
+(function(){
+  const DAY_START=6, DAY_END=22;
+  const DOW=["sön","mån","tis","ons","tor","fre","lör"];
+  const MON=["januari","februari","mars","april","maj","juni","juli","augusti","september","oktober","november","december"];
+  const $=id=>document.getElementById(id);
+  const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const pad=n=>String(n).padStart(2,"0");
+  const iso=d=>d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+  const fromIso=s=>{const [y,m,d]=s.split("-").map(Number);return new Date(y,m-1,d)};
+  const toMin=t=>{const [h,m]=t.split(":").map(Number);return h*60+m};
+  const nowMin=()=>{const d=new Date();return d.getHours()*60+d.getMinutes()};
+
+  let db=null, canWrite=true, loaded={h:false,b:false};
+  let horses=[], bookings=[], notes=[], noteConfirm=null;
+  let chat=[], chatSeen="";
+  let selected=iso(new Date()), viewMonth=new Date(new Date().getFullYear(),new Date().getMonth(),1);
+  let confirmId=null, editHorseId=null;
+
+  function toast(msg){const t=$("toast");t.textContent=msg;t.hidden=false;clearTimeout(toast._t);toast._t=setTimeout(()=>t.hidden=true,2400)}
+
+  /* ---------- render ---------- */
+  function render(){renderDays();renderSummary();renderBoard();renderFeed()}
+
+  function renderDays(){
+    const today=iso(new Date());
+    const y=viewMonth.getFullYear(),m=viewMonth.getMonth();
+    const title=MON[m].charAt(0).toUpperCase()+MON[m].slice(1)+" "+y;
+    let h=`<div class="calhead"><button class="btn nav" type="button" data-shift="-1" aria-label="Föregående månad">‹</button>
+      <h2 class="mtitle">${title}</h2>
+      <button class="btn nav" type="button" data-shift="1" aria-label="Nästa månad">›</button>
+      <button class="btn small" type="button" data-today="1">Idag</button></div>
+      <div class="cal" role="grid">`;
+    ["mån","tis","ons","tor","fre","lör","sön"].forEach(w=>h+=`<span class="wd">${w}</span>`);
+    const first=new Date(y,m,1), offset=(first.getDay()+6)%7;
+    const start=new Date(y,m,1-offset);
+    const weeks=Math.ceil((offset+new Date(y,m+1,0).getDate())/7);
+    const feedMode=!$("tab-fodring").hidden;
+    for(let i=0;i<weeks*7;i++){
+      const d=new Date(start);d.setDate(start.getDate()+i);const k=iso(d);
+      const n=bookings.filter(b=>b.date===k).length;
+      const items=allItems(), dn=items.filter(s=>feeding[k+"_"+s.id]).length;
+      const dots=dn?`<span class="cnt${dn===items.length?" full":""}" title="${dn} av ${items.length} klara">${dn}/${items.length}</span>`:"";
+      const cls=["cday"];if(d.getMonth()!==m)cls.push("out");if(k===today)cls.push("today");
+      h+=`<button type="button" class="${cls.join(" ")}" data-date="${k}" aria-pressed="${k===selected}" aria-label="${d.getDate()} ${MON[d.getMonth()]}, ${n} bokningar">
+        <span class="dnum">${d.getDate()}</span>
+        ${feedMode?dots:(n?`<span class="cnt">${n}<span class="cl"> bokn.</span></span>`:"")}</button>`;
+    }
+    h+="</div>";
+    $("days").innerHTML=h;
+  }
+
+  function dayBookings(hid){return bookings.filter(b=>b.horseId===hid&&b.date===selected).sort((a,b)=>a.start.localeCompare(b.start))}
+
+  function renderSummary(){
+    const d=fromIso(selected);
+    const label=`${DOW[d.getDay()]} ${d.getDate()} ${MON[d.getMonth()]}`;
+    const free=horses.filter(h=>dayBookings(h.id).length===0).length;
+    $("summary").innerHTML=horses.length?
+      `<span><strong>${label.charAt(0).toUpperCase()+label.slice(1)}</strong></span>
+       <span><strong>${horses.length-free}</strong> av ${horses.length} hästar har bokningar</span>
+       <span class="legend"><span><i style="background:var(--block)"></i>Bokad tid</span><span><i style="background:var(--busy)"></i>Nu</span></span>`
+      :`<span><strong>${label.charAt(0).toUpperCase()+label.slice(1)}</strong></span>`;
+  }
+
+  function renderBoard(){
+    const board=$("board");
+    if(!db){board.innerHTML="";return}
+    if(!loaded.h){board.innerHTML='<p class="emptyday">Hämtar stallet…</p>';return}
+    if(!horses.length){
+      board.innerHTML=`<div class="empty" style="grid-column:1/-1"><h2>Stallet är tomt än så länge</h2>
+        <p>Lägg till hästarna och deras ryttare, så dyker de upp här med en tidslinje för varje dag.</p>
+        ${canWrite?'<button class="btn primary" type="button" data-act="manage">Lägg till första hästen</button>':""}</div>`;
+      return;
+    }
+    const isToday=selected===iso(new Date()), nm=nowMin();
+    const span=(DAY_END-DAY_START)*60;
+    const pct=m=>Math.max(0,Math.min(100,(m-DAY_START*60)/span*100));
+    board.innerHTML=horses.map(h=>{
+      const bs=dayBookings(h.id);
+      const live=isToday?bs.find(b=>toMin(b.start)<=nm&&nm<toMin(b.end)):null;
+      let pill;
+      if(live) pill=`<span class="pill busy">Bokad nu · till ${live.end}</span>`;
+      else if(!bs.length) pill=`<span class="pill free">Ledig hela dagen</span>`;
+      else{
+        const next=isToday?bs.find(b=>toMin(b.start)>nm):null;
+        pill=isToday&&!next?`<span class="pill free">Ledig resten av dagen</span>`
+          :`<span class="pill some">${bs.length} bokning${bs.length>1?"ar":""}</span>`;
+      }
+      let ticks="";for(let t=DAY_START+2;t<DAY_END;t+=2)ticks+=`<span class="tick" style="left:${pct(t*60)}%"></span>`;
+      const blks=bs.map(b=>`<span class="blk" style="left:${pct(toMin(b.start))}%;width:${pct(toMin(b.end))-pct(toMin(b.start))}%" title="${esc(b.start+"–"+b.end+" "+b.rider)}"></span>`).join("");
+      const now=isToday&&nm>DAY_START*60&&nm<DAY_END*60?`<span class="now" style="left:${pct(nm)}%"></span>`:"";
+      const riders=(h.riders||[]).length?h.riders.map(r=>`<span class="chip">${esc(r)}</span>`).join(""):'<span class="chip none">Inga ryttare tillagda</span>';
+      const list=bs.length?`<ul class="blist">${bs.map(b=>{
+        const isLive=live&&live.id===b.id;
+        const ctl=!canWrite?"":confirmId===b.id
+          ?`<span class="confirm">Avboka?<button class="btn small danger" type="button" data-act="cancel-yes" data-id="${b.id}">Ja</button><button class="btn small" type="button" data-act="cancel-no">Nej</button></span>`
+          :`<button class="btn small" type="button" data-act="cancel" data-id="${b.id}">Avboka</button>`;
+        return `<li class="${isLive?"live":""}"><span class="time">${b.start}–${b.end}</span>
+          <span class="who"><b>${esc(b.rider)}</b>${b.note?`<span>${esc(b.note)}</span>`:""}</span>${ctl}</li>`}).join("")}</ul>`
+        :'<p class="emptyday">Inga bokningar den här dagen.</p>';
+      return `<article class="horse${live?" busy":""}">
+        <div class="hhead"><div class="plate" data-i="${esc((h.name||"?").charAt(0).toUpperCase())}"><div class="lbl">Häst</div><h2>${esc(h.name)}</h2></div>${pill}</div>
+        <div class="riders">${riders}</div>
+        <div><div class="timeline">${ticks}${blks}${now}</div>
+          <div class="tlabels"><span>${pad(DAY_START)}</span><span>10</span><span>14</span><span>18</span><span>${DAY_END}</span></div></div>
+        ${list}
+        ${canWrite?`<div class="hfoot"><button class="btn primary small" type="button" data-act="book" data-id="${h.id}">Boka ${esc(h.name)}</button></div>`:""}
+      </article>`;
+    }).join("");
+  }
+
+  /* ---------- events ---------- */
+  $("days").addEventListener("click",e=>{
+    const b=e.target.closest("button");if(!b)return;
+    if(b.dataset.shift){viewMonth=new Date(viewMonth.getFullYear(),viewMonth.getMonth()+Number(b.dataset.shift),1)}
+    else if(b.dataset.today){const t=new Date();selected=iso(t);viewMonth=new Date(t.getFullYear(),t.getMonth(),1)}
+    else if(b.dataset.date){selected=b.dataset.date;const d=fromIso(selected);viewMonth=new Date(d.getFullYear(),d.getMonth(),1)}
+    confirmId=null;render();
+  });
+
+  $("board").addEventListener("click",async e=>{
+    const b=e.target.closest("button[data-act]");if(!b)return;
+    const act=b.dataset.act;
+    if(act==="book") openBook(b.dataset.id);
+    else if(act==="manage") openManage();
+    else if(act==="cancel"){confirmId=b.dataset.id;renderBoard()}
+    else if(act==="cancel-no"){confirmId=null;renderBoard()}
+    else if(act==="cancel-yes"){
+      b.disabled=true;
+      try{await db.collection("bookings").doc(b.dataset.id).delete();toast("Bokningen är avbokad")}
+      catch(err){handleWriteErr(err)}
+      confirmId=null;renderBoard();
+    }
+  });
+
+  $("newBtn").onclick=()=>{if(!horses.length)openManage();else openBook(horses[0].id)};
+  $("manageBtn").onclick=openManage;
+
+  /* ---------- booking dialog ---------- */
+  function fillRiders(hid,keep){
+    const h=horses.find(x=>x.id===hid);
+    const rs=(h&&h.riders)||[];
+    $("bRider").innerHTML=rs.map(r=>`<option>${esc(r)}</option>`).join("")+'<option value="__other">Annan ryttare…</option>';
+    if(keep&&rs.includes(keep))$("bRider").value=keep;
+    $("otherWrap").hidden=$("bRider").value!=="__other";
+  }
+  function openBook(hid){
+    $("bHorse").innerHTML=horses.map(h=>`<option value="${h.id}">${esc(h.name)}</option>`).join("");
+    $("bHorse").value=hid;fillRiders(hid);
+    $("bDate").value=selected;
+    let s=selected===iso(new Date())?Math.ceil((nowMin()+1)/30)*30:17*60;
+    s=Math.max(DAY_START*60,Math.min(s,(DAY_END-1)*60));
+    $("bStart").value=pad(Math.floor(s/60))+":"+pad(s%60);
+    $("bEnd").value=pad(Math.floor((s+60)/60))+":"+pad((s+60)%60);
+    $("bNote").value="";$("bOther").value="";$("bErr").hidden=true;
+    updateSub();$("bookDlg").showModal();
+  }
+  function updateSub(){const h=horses.find(x=>x.id===$("bHorse").value);const d=$("bDate").value?fromIso($("bDate").value):null;
+    $("bookSub").textContent=h&&d?`${h.name} · ${DOW[d.getDay()]} ${d.getDate()} ${MON[d.getMonth()]}`:""}
+  $("bHorse").onchange=()=>{fillRiders($("bHorse").value);updateSub()};
+  $("bDate").onchange=updateSub;
+  $("bRider").onchange=()=>{$("otherWrap").hidden=$("bRider").value!=="__other";if(!$("otherWrap").hidden)$("bOther").focus()};
+  $("bCancel").onclick=()=>$("bookDlg").close();
+  $("bookForm").addEventListener("submit",async e=>{
+    e.preventDefault();
+    const err=m=>{$("bErr").textContent=m;$("bErr").hidden=false};
+    const horseId=$("bHorse").value,date=$("bDate").value,start=$("bStart").value,end=$("bEnd").value;
+    const rider=($("bRider").value==="__other"?$("bOther").value:$("bRider").value).trim();
+    const note=$("bNote").value.trim();
+    if(!rider)return err("Skriv vem som ska rida.");
+    if(!date||!start||!end)return err("Fyll i datum och tider.");
+    if(toMin(end)<=toMin(start))return err("Sluttiden måste vara efter starttiden.");
+    const clash=bookings.find(b=>b.horseId===horseId&&b.date===date&&toMin(start)<toMin(b.end)&&toMin(b.start)<toMin(end));
+    if(clash)return err(`Hästen är redan bokad ${clash.start}–${clash.end} av ${clash.rider}. Välj en annan tid.`);
+    $("bSave").disabled=true;
+    try{
+      await db.collection("bookings").add({horseId,date,start,end,rider,note,createdAt:new Date().toISOString()});
+      $("bookDlg").close();selected=date;
+      const sd=fromIso(date);viewMonth=new Date(sd.getFullYear(),sd.getMonth(),1);
+      render();toast("Bokat!");
+    }catch(x){handleWriteErr(x,err)}
+    $("bSave").disabled=false;
+  });
+
+  /* ---------- manage horses ---------- */
+  function openManage(){renderManage();resetHorseForm();$("manageDlg").showModal()}
+  function renderManage(){
+    $("mList").innerHTML=horses.length?horses.map(h=>`<li><span class="n"><b>${esc(h.name)}</b><span>${esc((h.riders||[]).join(", ")||"Inga ryttare")}</span></span>
+      <span style="display:flex;gap:6px;flex:0 0 auto">${confirmId==="h:"+h.id
+        ?`<button class="btn small danger" type="button" data-m="del-yes" data-id="${h.id}">Ta bort</button><button class="btn small" type="button" data-m="del-no">Nej</button>`
+        :`<button class="btn small" type="button" data-m="edit" data-id="${h.id}">Ändra</button><button class="btn small" type="button" data-m="del" data-id="${h.id}" aria-label="Ta bort ${esc(h.name)}">✕</button>`}</span></li>`).join("")
+      :'<li><span class="n"><span>Inga hästar ännu.</span></span></li>';
+  }
+  function resetHorseForm(){editHorseId=null;$("mName").value="";$("mRiders").value="";$("mSave").textContent="Lägg till häst";$("mReset").hidden=true;$("mErr").hidden=true}
+  $("mList").addEventListener("click",async e=>{
+    const b=e.target.closest("button[data-m]");if(!b)return;const id=b.dataset.id,h=horses.find(x=>x.id===id);
+    if(b.dataset.m==="edit"){editHorseId=id;$("mName").value=h.name;$("mRiders").value=(h.riders||[]).join(", ");$("mSave").textContent="Spara ändring";$("mReset").hidden=false;$("mName").focus()}
+    else if(b.dataset.m==="del"){confirmId="h:"+id;renderManage()}
+    else if(b.dataset.m==="del-no"){confirmId=null;renderManage()}
+    else if(b.dataset.m==="del-yes"){
+      b.disabled=true;
+      try{
+        const mine=bookings.filter(x=>x.horseId===id);
+        for(const x of mine) await db.collection("bookings").doc(x.id).delete();
+        await db.collection("horses").doc(id).delete();toast(`${h.name} är borttagen`);
+      }catch(x){handleWriteErr(x)}
+      confirmId=null;renderManage();
+    }
+  });
+  $("mReset").onclick=resetHorseForm;
+  $("mClose").onclick=()=>{confirmId=null;$("manageDlg").close()};
+  $("mForm").addEventListener("submit",async e=>{
+    e.preventDefault();
+    const name=$("mName").value.trim();
+    const riders=[...new Set($("mRiders").value.split(",").map(s=>s.trim()).filter(Boolean))];
+    if(!name){$("mErr").textContent="Skriv hästens namn.";$("mErr").hidden=false;return}
+    if(horses.some(h=>h.name.toLowerCase()===name.toLowerCase()&&h.id!==editHorseId)){$("mErr").textContent="Det finns redan en häst med det namnet.";$("mErr").hidden=false;return}
+    $("mSave").disabled=true;
+    try{
+      if(editHorseId) await db.collection("horses").doc(editHorseId).update({name,riders});
+      else await db.collection("horses").add({name,riders});
+      toast(editHorseId?"Ändringen är sparad":`${name} är tillagd`);resetHorseForm();
+    }catch(x){handleWriteErr(x,m=>{$("mErr").textContent=m;$("mErr").hidden=false})}
+    $("mSave").disabled=false;
+  });
+
+  /* ---------- tabs ---------- */
+  const TABS=["bokningar","fodring","anteckningar","chatt"];
+  let currentTab="bokningar";
+  function showTab(t){
+    if(!TABS.includes(t))t="bokningar";
+    TABS.forEach(x=>{$("tab-"+x).hidden=x!==t});
+    $("tabs").querySelectorAll("button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.tab===t)));
+    $("days").hidden=t==="anteckningar"||t==="chatt";
+    currentTab=t;document.body.setAttribute("data-tab",t);renderPinned();
+    if(t==="chatt"){markChatSeen();requestAnimationFrame(()=>scrollChat(true))}
+  }
+  $("tabs").addEventListener("click",e=>{const b=e.target.closest("button[data-tab]");if(b){showTab(b.dataset.tab);renderDays()}});
+  showTab((location.hash||"").slice(1));
+
+  /* ---------- chores & feeding ---------- */
+  const SLOTS=[{id:"morgon",name:"Morgonfodring",hint:"ca 06–08"},{id:"lunch",name:"Lunchfodring",hint:"ca 11–13"},{id:"kvall",name:"Kvällsfodring",hint:"ca 18–20"}];
+  const DEFAULT_CHORES=[{id:"c-mocka",name:"Mocka boxar"},{id:"c-vatten",name:"Fylla på vatten"},{id:"c-ut",name:"Släppa ut hästarna"},{id:"c-in",name:"Ta in hästarna"},{id:"c-sopa",name:"Sopa stallgången"}];
+  let feeding={}, feedConfirm=null, chores=DEFAULT_CHORES, choreEdit=false;
+  function allItems(){return SLOTS.concat(chores)}
+  function myName(){return ($("fWho").value||$("nWho").value||$("cWho").value||"").trim()}
+  function saveName(n){try{localStorage.setItem("stallboken-name",n)}catch(_){} $("fWho").value=n;$("nWho").value=n;$("cWho").value=n}
+  function itemRow(s,isChore){
+    const f=feeding[selected+"_"+s.id];
+    const del=choreEdit&&isChore&&canWrite?`<button class="btn small danger" type="button" data-f="rm" data-s="${s.id}" aria-label="Ta bort ${esc(s.name)}">Ta bort</button>`:"";
+    if(f){
+      const t=new Date(f.at);
+      const ctl=del||(!canWrite?"":feedConfirm===s.id
+        ?`<span class="confirm">Ångra?<button class="btn small danger" type="button" data-f="yes" data-s="${s.id}">Ja</button><button class="btn small" type="button" data-f="no">Nej</button></span>`
+        :`<button class="btn small" type="button" data-f="undo" data-s="${s.id}">Ångra</button>`);
+      return `<li class="fslot done"><span class="fcheck" aria-hidden="true">✓</span>
+        <span class="finfo"><b>${esc(s.name)}</b><span>Gjort av ${esc(f.by||"någon")} kl ${pad(t.getHours())}:${pad(t.getMinutes())}</span></span>${ctl}</li>`;
+    }
+    return `<li class="fslot">${canWrite&&!del?`<button class="fcheck" type="button" data-f="check" data-s="${s.id}" aria-label="Bocka i ${esc(s.name)}"></button>`:'<span class="fcheck"></span>'}
+      <span class="finfo"><b>${esc(s.name)}</b><span>Inte gjort än${s.hint?" · "+s.hint:""}</span></span>${del}</li>`;
+  }
+  function renderFeed(){
+    const d=fromIso(selected);
+    $("fSub").textContent=`${DOW[d.getDay()].charAt(0).toUpperCase()+DOW[d.getDay()].slice(1)} ${d.getDate()} ${MON[d.getMonth()]}. Bocka i det du har gjort, så ser alla vad som är klart.`;
+    if(!db){$("feed").innerHTML="";return}
+    const done=allItems().filter(s=>feeding[selected+"_"+s.id]).length;
+    $("feed").innerHTML=`<p class="progress"><b>${done} av ${allItems().length}</b> klara</p>
+      <h3 class="grp">Fodring</h3><ul class="feed">${SLOTS.map(s=>itemRow(s,false)).join("")}</ul>
+      <div class="grphead"><h3 class="grp">Sysslor</h3>${canWrite?`<button class="btn small" type="button" data-f="edit">${choreEdit?"Klar":"Ändra sysslor"}</button>`:""}</div>
+      <ul class="feed">${chores.length?chores.map(s=>itemRow(s,true)).join(""):'<li class="fslot"><span class="finfo"><span>Inga sysslor. Lägg till en med Ändra sysslor.</span></span></li>'}</ul>
+      ${choreEdit?`<form class="addchore" id="cForm"><div class="field"><label for="cName">Ny syssla</label><input id="cName" maxlength="40" placeholder="t.ex. Hämta spån"></div><button class="btn primary" type="submit">Lägg till</button></form>`:""}`;
+  }
+  async function saveChores(list){
+    await db.doc("config/chores").set({list});
+  }
+  $("feed").addEventListener("submit",async e=>{
+    if(e.target.id!=="cForm")return;e.preventDefault();
+    const name=$("cName").value.trim();if(!name)return;
+    if(chores.some(c=>c.name.toLowerCase()===name.toLowerCase())){$("fErr").textContent="Den sysslan finns redan.";$("fErr").hidden=false;return}
+    const id="c-"+Date.now().toString(36);
+    try{await saveChores(chores.concat([{id,name}]));$("fErr").hidden=true;toast(`${name} är tillagd`)}
+    catch(x){handleWriteErr(x,m=>{$("fErr").textContent=m;$("fErr").hidden=false})}
+  });
+  $("feed").addEventListener("click",async e=>{
+    const b=e.target.closest("button[data-f]");if(!b)return;
+    const act=b.dataset.f,sid=b.dataset.s,docId=selected+"_"+sid;
+    if(act==="edit"){choreEdit=!choreEdit;renderFeed();if(choreEdit)$("cName").focus();return}
+    if(act==="undo"){feedConfirm=sid;renderFeed();return}
+    if(act==="no"){feedConfirm=null;renderFeed();return}
+    b.disabled=true;
+    try{
+      if(act==="rm"){
+        const c=chores.find(x=>x.id===sid);
+        await saveChores(chores.filter(x=>x.id!==sid));toast(`${c?c.name:"Sysslan"} är borttagen`);
+      }else if(act==="check"){
+        const by=myName();
+        if(!by){$("fErr").textContent="Skriv ditt namn först, så syns det vem som gjort det.";$("fErr").hidden=false;$("fWho").focus();b.disabled=false;return}
+        saveName(by);$("fErr").hidden=true;
+        await db.collection("feeding").doc(docId).set({date:selected,slot:sid,by,at:new Date().toISOString()});
+        toast("Avbockat");
+      }else if(act==="yes"){
+        await db.collection("feeding").doc(docId).delete();toast("Avbockningen är ångrad");
+      }
+    }catch(x){handleWriteErr(x,m=>{$("fErr").textContent=m;$("fErr").hidden=false})}
+    feedConfirm=null;renderFeed();
+  });
+
+  /* ---------- notebook ---------- */
+  try{const n=localStorage.getItem("stallboken-name")||"";$("nWho").value=n;$("fWho").value=n;$("cWho").value=n}catch(_){}
+  const PIN_SVG='<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="currentColor"><path d="M14.5 2.5 21.5 9.5l-2 1.2-1.7-.4-3.3 3.3.4 3.9-1.6 1.6-3.7-3.7L4 21l-1-1 5.6-5.6-3.7-3.7 1.6-1.6 3.9.4 3.3-3.3-.4-1.7z"/></svg>';
+  function sortedNotes(){return notes.slice().sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0)||(b.pinned&&a.pinned?String(b.pinnedAt).localeCompare(String(a.pinnedAt)):0)||String(b.createdAt).localeCompare(String(a.createdAt)))}
+  function noteWhen(iso){const d=new Date(iso);return `${d.getDate()} ${MON[d.getMonth()].slice(0,3)} ${pad(d.getHours())}:${pad(d.getMinutes())}`}
+  function renderPinned(){
+    const el=$("pinned");if(!el)return;
+    const pins=sortedNotes().filter(n=>n.pinned);
+    if(!db||!pins.length||(currentTab==="anteckningar"||currentTab==="chatt")){el.hidden=true;el.innerHTML="";return}
+    el.hidden=false;
+    const show=pins.slice(0,3);
+    el.innerHTML=`<div class="pinhead"><span class="pinlbl">${PIN_SVG} Viktigt</span>
+      <button class="linkbtn" type="button" data-go="anteckningar">${pins.length>3?`Visa alla ${pins.length}`:"Anteckningsboken"} →</button></div>
+      <ul class="pinlist">${show.map(n=>`<li>${n.photo?photoTag(n.photo,"pphoto"):""}${n.text?`<p class="ptxt">${esc(n.text)}</p>`:""}<span class="pmeta">${esc(n.author||"Någon")} · ${noteWhen(n.createdAt)}</span></li>`).join("")}</ul>`;
+    hydratePhotos(el);
+  }
+  $("pinned").addEventListener("click",e=>{const b=e.target.closest("[data-go]");if(b){showTab(b.dataset.go);renderDays();window.scrollTo({top:0})}});
+  function renderNotes(){
+    renderPinned();
+    const el=$("notes");
+    if(!db){el.innerHTML="";return}
+    if(!notes.length){el.innerHTML='<li class="note"><span class="txt" style="color:var(--muted)">Inga anteckningar än. Skriv den första ovan.</span></li>';return}
+    el.innerHTML=sortedNotes().map(n=>{
+      const when=noteWhen(n.createdAt);
+      const ctl=!canWrite?"":noteConfirm===n.id
+        ?`<span class="confirm ctl">Ta bort?<button class="btn small danger" type="button" data-n="yes" data-id="${n.id}">Ja</button><button class="btn small" type="button" data-n="no">Nej</button></span>`
+        :`<span class="ctl nctl"><button class="btn small${n.pinned?" pinon":""}" type="button" data-n="pin" data-id="${n.id}" aria-pressed="${!!n.pinned}">${PIN_SVG} ${n.pinned?"Lossa":"Fäst"}</button><button class="btn small" type="button" data-n="del" data-id="${n.id}" aria-label="Ta bort anteckning">Ta bort</button></span>`;
+      return `<li class="note${n.pinned?" ispinned":""}"><span class="meta">${n.pinned?`<span class="ptag">${PIN_SVG} Fäst</span> `:""}<b>${esc(n.author||"Någon")}</b> · ${when}</span>${ctl}<span class="txt">${esc(n.text||"")}${n.photo?photoTag(n.photo,"nphoto"):""}</span></li>`;
+    }).join("");
+    hydratePhotos(el);
+  }
+  $("notes").addEventListener("click",async e=>{
+    const b=e.target.closest("button[data-n]");if(!b)return;
+    if(b.dataset.n==="del"){noteConfirm=b.dataset.id;renderNotes()}
+    else if(b.dataset.n==="no"){noteConfirm=null;renderNotes()}
+    else if(b.dataset.n==="pin"){
+      const n=notes.find(x=>x.id===b.dataset.id);if(!n)return;b.disabled=true;
+      try{await db.collection("notes").doc(n.id).update({pinned:!n.pinned,pinnedAt:n.pinned?null:new Date().toISOString()});toast(n.pinned?"Anteckningen är lossad":"Anteckningen är fäst högst upp")}
+      catch(x){handleWriteErr(x);b.disabled=false}
+    }
+    else{b.disabled=true;try{const n=notes.find(x=>x.id===b.dataset.id);await db.collection("notes").doc(b.dataset.id).delete();if(n&&n.photo)db.collection("photos").doc(n.photo).delete().catch(()=>{});toast("Anteckningen är borttagen")}catch(x){handleWriteErr(x)}noteConfirm=null;renderNotes()}
+  });
+  $("nForm").addEventListener("submit",async e=>{
+    e.preventDefault();
+    const text=$("nText").value.trim(),author=$("nWho").value.trim();
+    if(!text&&!pending.n){$("nErr").textContent="Skriv något eller lägg till ett foto.";$("nErr").hidden=false;return}
+    if(!db){return}
+    if(author)saveName(author);
+    $("nSave").disabled=true;$("nSave").textContent=pending.n?"Laddar upp…":"Sparar…";
+    try{const photo=pending.n?await storePhoto(pending.n):null;
+      await db.collection("notes").add({text,author,photo,createdAt:new Date().toISOString(),pinned:$("nPin").checked,pinnedAt:$("nPin").checked?new Date().toISOString():null});$("nText").value="";$("nPin").checked=false;clearPending("n");$("nErr").hidden=true;toast("Anteckningen är sparad")}
+    catch(x){handleWriteErr(x,m=>{$("nErr").textContent=m;$("nErr").hidden=false})}
+    $("nSave").disabled=false;$("nSave").textContent="Spara anteckning";
+  });
+
+  /* ---------- photos ---------- */
+  const pending={n:null,c:null}, photoCache=new Map(), photoLoading=new Map();
+  function loadImage(file){return new Promise((res,rej)=>{const u=URL.createObjectURL(file);const im=new Image();im.onload=()=>{res(im)};im.onerror=()=>rej(new Error("bad"));im.src=u})}
+  async function compressPhoto(file){
+    const im=await loadImage(file);
+    let max=1280,q=0.78,out="";
+    for(let i=0;i<8;i++){
+      const s=Math.min(1,max/Math.max(im.naturalWidth,im.naturalHeight));
+      const w=Math.max(1,Math.round(im.naturalWidth*s)),h=Math.max(1,Math.round(im.naturalHeight*s));
+      const cv=document.createElement("canvas");cv.width=w;cv.height=h;
+      const cx=cv.getContext("2d");cx.fillStyle="#fff";cx.fillRect(0,0,w,h);cx.drawImage(im,0,0,w,h);
+      out=cv.toDataURL("image/jpeg",q);
+      if(out.length<=230000)return {data:out,w,h};
+      if(q>0.55)q-=0.1;else max=Math.round(max*0.8);
+    }
+    return {data:out,w:0,h:0};
+  }
+  async function storePhoto(p){const ref=await db.collection("photos").add({data:p.data,w:p.w,h:p.h,createdAt:new Date().toISOString()});photoCache.set(ref.id,p.data);return ref.id}
+  function photoTag(id,cls){return `<button type="button" class="photo ${cls}" data-photo="${esc(id)}" aria-label="Visa foto"><img alt="Foto" data-pid="${esc(id)}"></button>`}
+  function getPhoto(id){
+    if(photoCache.has(id))return Promise.resolve(photoCache.get(id));
+    if(!photoLoading.has(id))photoLoading.set(id,db.collection("photos").doc(id).get().then(d=>{const v=d.exists?d.data().data:"";photoCache.set(id,v);return v}).catch(()=>""));
+    return photoLoading.get(id);
+  }
+  function hydratePhotos(root){
+    root.querySelectorAll("img[data-pid]").forEach(img=>{
+      const id=img.dataset.pid;
+      getPhoto(id).then(src=>{if(src){img.src=src;img.onload=()=>{if(root.id==="msgs"){const m=img.closest(".msg"),all=root.querySelectorAll(".msg");if(m&&[...all].slice(-3).includes(m))root.scrollTop=root.scrollHeight}}}else img.closest(".photo").classList.add("missing")});
+    });
+  }
+  function clearPending(k){pending[k]=null;const p=$(k+"Prev");p.hidden=true;p.innerHTML="";$(k+"File").value=""}
+  function setupPicker(k){
+    $(k+"File").addEventListener("change",async e=>{
+      const f=e.target.files&&e.target.files[0];if(!f)return;
+      const errEl=$(k+"Err");
+      if(!f.type.startsWith("image/")){errEl.textContent="Det där är ingen bild. Välj ett foto.";errEl.hidden=false;return}
+      const p=$(k+"Prev");p.hidden=false;p.innerHTML='<span class="ptiny">Förminskar bilden…</span>';
+      try{
+        pending[k]=await compressPhoto(f);errEl.hidden=true;
+        p.innerHTML=`<img src="${pending[k].data}" alt="Vald bild"><span class="ptiny">${Math.round(pending[k].data.length*0.75/1024)} kB</span><button type="button" class="btn small" data-clear="${k}">Ta bort</button>`;
+      }catch(_){clearPending(k);errEl.textContent="Bilden gick inte att läsa. Prova ett annat foto.";errEl.hidden=false}
+    });
+    $(k+"Prev").addEventListener("click",e=>{if(e.target.closest("[data-clear]"))clearPending(k)});
+  }
+  setupPicker("n");setupPicker("c");
+  document.addEventListener("click",e=>{
+    const b=e.target.closest("button[data-photo]");if(!b)return;
+    const img=b.querySelector("img");if(!img||!img.src)return;
+    $("photoBig").src=img.src;$("photoDlg").showModal();
+  });
+  $("photoClose").onclick=()=>$("photoDlg").close();
+  $("photoDlg").addEventListener("click",e=>{if(e.target===$("photoDlg"))$("photoDlg").close()});
+
+  /* ---------- chat ---------- */
+  try{chatSeen=localStorage.getItem("stallboken-chatseen")||""}catch(_){}
+  function markChatSeen(){
+    const last=chat.length?chat[chat.length-1].createdAt:"";
+    if(last&&last>chatSeen){chatSeen=last;try{localStorage.setItem("stallboken-chatseen",last)}catch(_){}}
+    updateBadge();
+  }
+  function updateBadge(){
+    const me=myName().toLowerCase();
+    const n=chat.filter(m=>m.createdAt>chatSeen&&(m.author||"").toLowerCase()!==me).length;
+    const b=$("chatBadge");b.hidden=!n||currentTab==="chatt";b.textContent=n>9?"9+":String(n);
+  }
+  function scrollChat(force){
+    const el=$("msgs");if(!el)return;
+    const near=el.scrollHeight-el.scrollTop-el.clientHeight<120;
+    if(force||near)el.scrollTop=el.scrollHeight;
+  }
+  function dayLabel(d){
+    const t=new Date(),y=new Date();y.setDate(t.getDate()-1);
+    if(iso(d)===iso(t))return "Idag";if(iso(d)===iso(y))return "Igår";
+    return `${DOW[d.getDay()]} ${d.getDate()} ${MON[d.getMonth()]}`;
+  }
+  function renderChat(){
+    const el=$("msgs");
+    $("cWhoWrap").hidden=!!myName();
+    if(!db){el.innerHTML="";return}
+    if(!chat.length){el.innerHTML='<p class="chatempty">Inga meddelanden än. Säg hej till stallet!</p>';return}
+    const me=myName().toLowerCase();let h="",lastDay="",lastAuthor="",lastT=0;
+    chat.forEach(m=>{
+      const d=new Date(m.createdAt),dk=iso(d);
+      if(dk!==lastDay){h+=`<div class="dsep"><span>${dayLabel(d)}</span></div>`;lastDay=dk;lastAuthor=""}
+      const mine=me&&(m.author||"").toLowerCase()===me;
+      const cont=lastAuthor===(m.author||"")&&d-lastT<5*60000;
+      h+=`<div class="msg${mine?" mine":""}${cont?" cont":""}">${!mine&&!cont?`<span class="mwho">${esc(m.author||"Någon")}</span>`:""}
+        <div class="bubble${m.photo?" hasphoto":""}">${m.photo?photoTag(m.photo,"cphoto"):""}${esc(m.text||"")}<span class="mtime">${pad(d.getHours())}:${pad(d.getMinutes())}</span></div></div>`;
+      lastAuthor=m.author||"";lastT=d;
+    });
+    el.innerHTML=h;hydratePhotos(el);
+  }
+  async function sendChat(){
+    const text=$("cText").value.trim();if((!text&&!pending.c)||!db)return;
+    let who=myName()||$("cWho").value.trim();
+    if(!who){$("cErr").textContent="Skriv ditt namn först, så vet alla vem som skriver.";$("cErr").hidden=false;$("cWho").focus();return}
+    saveName(who);$("cErr").hidden=true;$("cSend").disabled=true;
+    try{const photo=pending.c?await storePhoto(pending.c):null;
+      await db.collection("chat").add({text,author:who,photo,createdAt:new Date().toISOString()});$("cText").value="";clearPending("c");autoGrow();scrollChat(true)}
+    catch(x){handleWriteErr(x,m=>{$("cErr").textContent=m;$("cErr").hidden=false})}
+    $("cSend").disabled=false;$("cText").focus();
+  }
+  function autoGrow(){const t=$("cText");t.style.height="auto";t.style.height=Math.min(t.scrollHeight,140)+"px"}
+  $("cText").addEventListener("input",autoGrow);
+  $("cText").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendChat()}});
+  $("chatForm").addEventListener("submit",e=>{e.preventDefault();sendChat()});
+
+  function handleWriteErr(e,show){
+    let m="Det gick inte att spara. Försök igen om en stund.";
+    if(e&&e.code==="invalid_argument"){m="Du har bara läsbehörighet. Be den som delade sidan att ge dig rätt att ändra.";setReadOnly()}
+    else if(e&&e.code==="quota_exceeded")m="Lagringen är full. Ta bort gamla bokningar och försök igen.";
+    else if(e&&e.code==="booking_clash")m="Någon hann boka hästen på den tiden. Välj en annan tid.";
+    else if(e&&e.code==="signed_out")m="Du har blivit utloggad. Logga in igen och försök på nytt.";
+    show?show(m):toast(m);
+  }
+  function setReadOnly(){
+    canWrite=false;$("newBtn").hidden=true;$("manageBtn").hidden=true;
+    $("nForm").hidden=true;$("chatForm").hidden=true;
+    $("status").innerHTML='<div class="ro">Du kan se bokningarna men inte ändra dem.</div>';render();renderNotes();
+  }
+
+  /* ---------- data ---------- */
+  render();
+  setInterval(()=>{if(selected===iso(new Date()))renderBoard()},60000);
+  (async()=>{
+    db=await window.claude?.use?.("db");
+    if(!db){$("status").innerHTML='<div class="notice">Bokningarna kunde inte laddas. Logga in och öppna sidan igen.</div>';$("newBtn").hidden=true;$("manageBtn").hidden=true;renderBoard();return}
+    try{const user=await window.claude.use("user");if(user){const c=await user.can("data.write");if(c===false)setReadOnly()}}catch(_){}
+    db.collection("horses").orderBy("name").onSnapshot(s=>{
+      horses=s.docs.map(d=>({id:d.id,...d.data()}));loaded.h=true;render();
+      if($("manageDlg").open)renderManage();
+    },e=>{$("status").innerHTML='<div class="notice">Kontakten med stallboken bröts. Ladda om sidan.</div>'});
+    db.collection("bookings").onSnapshot(s=>{
+      bookings=s.docs.map(d=>({id:d.id,...d.data()}));loaded.b=true;render();
+    },e=>{$("status").innerHTML='<div class="notice">Kontakten med stallboken bröts. Ladda om sidan.</div>'});
+    db.doc("config/chores").onSnapshot(d=>{
+      const l=d.exists&&Array.isArray(d.data().list)?d.data().list:null;
+      chores=l||DEFAULT_CHORES;renderFeed();renderDays();
+    },()=>{});
+    db.collection("feeding").onSnapshot(s=>{
+      feeding={};s.docs.forEach(d=>{feeding[d.id]=d.data()});renderFeed();renderDays();
+    },e=>{$("status").innerHTML='<div class="notice">Kontakten med stallboken bröts. Ladda om sidan.</div>'});
+    db.collection("chat").orderBy("createdAt","desc").limit(150).onSnapshot(s=>{
+      chat=s.docs.map(d=>({id:d.id,...d.data()})).reverse();renderChat();
+      if(currentTab==="chatt"){scrollChat(false);markChatSeen()}else updateBadge();
+    },e=>{$("status").innerHTML='<div class="notice">Kontakten med stallboken bröts. Ladda om sidan.</div>'});
+    db.collection("notes").orderBy("createdAt","desc").limit(200).onSnapshot(s=>{
+      notes=s.docs.map(d=>({id:d.id,...d.data()}));renderNotes();
+    },e=>{$("status").innerHTML='<div class="notice">Kontakten med stallboken bröts. Ladda om sidan.</div>'});
+  })();
+})();
+</script>
+
+<style>
+/* inloggning – samma western-tokens som appen */
+#auth{position:fixed;inset:0;z-index:50;overflow-y:auto;background-color:var(--bg);
+  background-image:radial-gradient(rgba(125,93,64,.07) 1px,transparent 1.2px),radial-gradient(rgba(125,93,64,.05) 1px,transparent 1.2px);
+  background-size:22px 22px,13px 13px;background-position:0 0,7px 9px;
+  padding:calc(24px + env(safe-area-inset-top,0px)) 16px calc(24px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px}
+body:not(.authed) .wrap{display:none}
+.auth-brand{text-align:center;display:flex;flex-direction:column;gap:6px;align-items:center}
+.auth-brand .star{font-size:30px;color:var(--pine);line-height:1}
+.auth-brand h1{font-family:var(--wood);font-weight:400;color:var(--leather);font-size:clamp(28px,7vw,40px);line-height:1.1;margin:0;text-wrap:balance}
+.auth-brand p{margin:0;font-family:var(--display);font-style:italic;color:var(--muted)}
+.auth-card{width:min(400px,100%);background:var(--surface);border:1.5px solid var(--rope);border-radius:10px;box-shadow:var(--shadow);outline:1.5px dashed var(--rope);outline-offset:-7px;padding:26px 24px;display:flex;flex-direction:column;gap:14px}
+.auth-card h2{font-family:var(--display);font-weight:700;font-size:21px;margin:0;color:var(--leather)}
+.auth-card .lead{margin:-6px 0 0;color:var(--muted)}
+.auth-card .field input{font-size:16px;padding:12px}
+.auth-card .btn.primary{padding:13px;font-size:14px}
+.linkish{background:none;border:none;padding:4px 0;color:var(--pine);font-weight:600;text-decoration:underline;text-underline-offset:3px;align-self:center}
+.auth-card .ok{margin:0;color:var(--free);font-weight:600}
+.spinner{width:28px;height:28px;border-radius:50%;border:3px solid var(--line);border-top-color:var(--pine);margin:10px auto;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spinner{animation:none}}
+/* inloggad-raden i sidhuvudet */
+.mebar{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted)}
+.mebar b{color:var(--fg)}
+body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
+/* admin-dialogen */
+#inviteDlg .sheet{gap:14px}
+#inv-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;max-height:36vh;overflow:auto}
+#inv-list li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:var(--surface-2);border-radius:6px}
+#inv-list .n{min-width:0}
+#inv-list .n b{display:block}
+#inv-list .n span{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+#inv-ok{color:var(--free);font-weight:600;margin:0}
+@media (max-width:640px){
+  body.authed header.top{flex-wrap:wrap;gap:10px;padding-bottom:12px}
+  body.authed .brand{flex:1 1 100%}
+  body.authed .brand h1{white-space:nowrap;font-size:clamp(19px,6vw,24px)}
+  body.authed .hactions{width:100%;flex-wrap:nowrap;align-items:center;gap:6px}
+  body.authed .hactions .btn{padding:7px 11px;min-height:36px;font-size:13px}
+  .mebar{margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mebar .lbl{display:none}
+}
+</style>
+
+<div id="auth">
+  <div class="auth-brand">
+    <span class="star" aria-hidden="true">★</span>
+    <h1>Stallboken Eggebyberg</h1>
+    <p>Boka hästar, bocka av sysslor och håll kontakten i stallet</p>
+  </div>
+
+  <div class="auth-card" id="auth-loading"><div class="spinner" role="status" aria-label="Laddar"></div></div>
+
+  <form class="auth-card" id="auth-login" hidden novalidate>
+    <h2>Logga in</h2>
+    <div class="field"><label for="li-email">E-post</label><input id="li-email" type="email" autocomplete="email" required></div>
+    <div class="field"><label for="li-pw">Lösenord</label><input id="li-pw" type="password" autocomplete="current-password" required></div>
+    <p class="err" id="login-err" hidden></p>
+    <button class="btn primary" type="submit" id="li-btn">Logga in</button>
+    <button class="linkish" type="button" id="li-forgot">Glömt lösenord?</button>
+    <p class="hint" style="text-align:center">Stallboken är bara för inbjudna. Saknar du konto, be den som sköter stallboken om en inbjudan.</p>
+  </form>
+
+  <form class="auth-card" id="auth-forgot" hidden novalidate>
+    <h2>Glömt lösenord</h2>
+    <p class="lead">Skriv din e-post så skickar vi en länk där du väljer ett nytt lösenord.</p>
+    <div class="field"><label for="fg-email">E-post</label><input id="fg-email" type="email" autocomplete="email" required></div>
+    <p class="err" id="forgot-err" hidden></p>
+    <button class="btn primary" type="submit" id="fg-btn">Skicka länk</button>
+    <button class="linkish" type="button" id="fg-back">Tillbaka till inloggning</button>
+  </form>
+
+  <div class="auth-card" id="auth-sent" hidden>
+    <h2>Kolla din e-post</h2>
+    <p class="lead">Om <b id="sent-to"></b> finns i Stallboken har vi skickat en länk dit. Öppna mejlet och tryck på länken. Titta i skräpposten om det dröjer.</p>
+    <button class="linkish" type="button" id="sent-back">Tillbaka till inloggning</button>
+  </div>
+
+  <form class="auth-card" id="auth-setpw" hidden novalidate>
+    <h2 id="setpw-title">Välj lösenord</h2>
+    <p class="lead" id="setpw-lead"></p>
+    <div class="field" id="sp-name-wrap"><label for="sp-name">Ditt namn</label><input id="sp-name" maxlength="40" autocomplete="name" placeholder="Så som de andra i stallet känner dig"></div>
+    <div class="field"><label for="sp-pw">Lösenord</label><input id="sp-pw" type="password" autocomplete="new-password" minlength="8" required></div>
+    <div class="field"><label for="sp-pw2">Upprepa lösenordet</label><input id="sp-pw2" type="password" autocomplete="new-password" minlength="8" required></div>
+    <p class="hint">Minst 8 tecken.</p>
+    <p class="err" id="setpw-err" hidden></p>
+    <button class="btn primary" type="submit" id="sp-btn">Spara och gå in</button>
+  </form>
+</div>
+
+<dialog id="inviteDlg">
+  <div class="sheet">
+    <h3>Ryttare i Stallboken</h3>
+    <ul id="inv-list"><li class="inv-empty">Hämtar…</li></ul>
+    <form id="inv-form" style="display:flex;flex-direction:column;gap:10px">
+      <div class="field"><label for="inv-email">E-post till den du vill bjuda in</label><input id="inv-email" type="email" required placeholder="namn@exempel.se"></div>
+      <div class="field"><label for="inv-name">Namn (valfritt)</label><input id="inv-name" maxlength="40" placeholder="Fylls i av personen själv annars"></div>
+      <p class="err" id="inv-err" hidden></p>
+      <p id="inv-ok" hidden></p>
+      <div class="actions">
+        <button class="btn" type="button" id="inv-close">Stäng</button>
+        <button class="btn primary" type="submit" id="inv-btn">Skicka inbjudan</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+
+</body>
+</html>
