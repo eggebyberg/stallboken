@@ -263,7 +263,7 @@
     show("app");
     resolveReady();
   }
-  let entered = false;
+  let entered = false, loggingOut = false;
   async function goIn(session){
     if(entered) return;
     await loadMe(session);
@@ -289,7 +289,7 @@
     show("loading");
 
     sb.auth.onAuthStateChange((evt, session) => {
-      if(evt === "SIGNED_OUT"){ location.replace(location.pathname); return; }
+      if(evt === "SIGNED_OUT"){ if(loggingOut) location.replace(location.pathname); return; }
       if(evt === "INITIAL_SESSION"){
         setTimeout(() => {
           if(linkCode) openLink();
@@ -319,7 +319,6 @@
       if(pw.length < 8) return authErr("register", "Lösenordet behöver vara minst 8 tecken.");
       if(pw !== pw2) return authErr("register", "Lösenorden är inte likadana. Skriv samma två gånger.");
       const btn = $("rg-btn"); busy(btn, true, "Skapar konto…");
-      await sb.auth.signOut({scope:"local"}).catch(()=>{});
       const {data, error} = await sb.auth.signUp({email, password:pw, options:{data:{invite:linkCode, name}}});
       busy(btn, false, "Skapa konto och gå in");
       if(error){
@@ -342,7 +341,6 @@
       const btn = $("rs-btn"); busy(btn, true, "Sparar…");
       const r = await sb.rpc("reset_password", {p_code: linkCode, p_password: pw});
       if(r.error){ busy(btn, false, "Spara och gå in"); return authErr("reset", /gäller inte/i.test(r.error.message) ? "Länken gäller inte längre. Be om en ny." : "Det gick inte att spara. Försök igen."); }
-      await sb.auth.signOut({scope:"local"}).catch(()=>{});
       const {data, error} = await sb.auth.signInWithPassword({email: r.data, password: pw});
       busy(btn, false, "Spara och gå in");
       clearLink();
@@ -351,7 +349,7 @@
     });
 
     /* logga ut */
-    $("logoutBtn").onclick = async () => { await sb.auth.signOut(); };
+    $("logoutBtn").onclick = async () => { loggingOut = true; await sb.auth.signOut().catch(()=>{}); location.replace(location.pathname); };
 
     /* ---------- admin: länkar och ryttare ---------- */
     const linkText = (url, kind, name) => kind === "reset"
