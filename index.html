@@ -388,12 +388,34 @@
       $("mList").addEventListener("click", e => { if(e.target.closest('[data-m="edit"]')) setTimeout(sync, 0); });
     })();
 
-    /* boka: välj dig själv som ryttare om du rider hästen */
-    new MutationObserver(() => {
-      if(!$("bookDlg").open || !me) return;
-      const sel = $("bRider"), mine = me.name || "";
-      if(mine && [...sel.options].some(o => o.value === mine)){ sel.value = mine; sel.dispatchEvent(new Event("change")); }
-    }).observe($("bookDlg"), {attributes:true, attributeFilter:["open"]});
+    /* ---------- boka: alla registrerade (även admin) kan väljas som ryttare ---------- */
+    let allPeople = [];
+    async function loadPeopleAll(){
+      const r = await sb.from("profiles").select("name,email").order("name");
+      allPeople = [...new Set((r.data || []).map(p => p.name || (p.email || "").split("@")[0]).filter(Boolean))].sort((a, b) => a.localeCompare(b, "sv"));
+    }
+    loadPeopleAll(); watch("profiles", loadPeopleAll);
+    function augmentRiders(){
+      const sel = $("bRider"); if(!sel || sel.querySelector("optgroup")) return;
+      const opts = [...sel.options], other = opts.find(o => o.value === "__other");
+      const horseRiders = opts.filter(o => o.value !== "__other");
+      const listed = new Set(horseRiders.map(o => o.value));
+      const extra = allPeople.filter(n => !listed.has(n));
+      if(horseRiders.length){
+        const g = document.createElement("optgroup"); g.label = "Hästens ryttare";
+        horseRiders.forEach(o => g.append(o)); sel.insertBefore(g, other);
+      }
+      if(extra.length){
+        const g = document.createElement("optgroup"); g.label = "Övriga i stallet";
+        extra.forEach(n => g.append(new Option(n, n))); sel.insertBefore(g, other);
+      }
+      const mine = me && me.name;
+      if(mine && [...sel.options].some(o => o.value === mine)) sel.value = mine;
+      else if(sel.value === "__other" && sel.options.length > 1) sel.selectedIndex = 0;
+      sel.dispatchEvent(new Event("change"));
+    }
+    new MutationObserver(() => { if($("bookDlg").open) augmentRiders(); }).observe($("bookDlg"), {attributes:true, attributeFilter:["open"]});
+    $("bHorse").addEventListener("change", () => setTimeout(augmentRiders, 0));
 
     /* ---------- admin: logg ---------- */
     const LOGPAGE = 150; let logRows = [], logArea = "", logDone = false;
