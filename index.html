@@ -291,6 +291,7 @@
     ["fWho","nWho","cWho"].forEach(id => { const el = $(id); if(el) el.value = name; });
     $("meName").textContent = name;
     $("adminBtn").hidden = !me.is_admin;
+    document.body.classList.toggle("is-admin", !!me.is_admin);
     show("app");
     resolveReady();
     setTimeout(() => window.__stallNotis && window.__stallNotis.start(), 600);
@@ -1871,6 +1872,8 @@ body:not(.authed) .wrap{display:none}
 .mebar{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted)}
 .mebar b{color:var(--fg)}
 body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
+/* hästar läggs till och tas bort av admin */
+body.authed:not(.is-admin) #manageBtn,body.authed:not(.is-admin) [data-act="manage"]{display:none!important}
 /* admin-sidan */
 #adminPage{position:fixed;inset:0;z-index:40;overflow-y:auto;background-color:var(--bg);
   background-image:radial-gradient(rgba(125,93,64,.07) 1px,transparent 1.2px);background-size:22px 22px;
