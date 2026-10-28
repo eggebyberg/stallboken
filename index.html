@@ -246,6 +246,7 @@
   function authErr(form, msg){ const p = $(form + "-err"); p.textContent = msg; p.hidden = !msg; }
   function busy(btn, on, label){ btn.disabled = on; if(label) btn.textContent = label; }
   const clearLink = () => history.replaceState(null, "", location.pathname);
+  function toast(msg){ const t = $("toast"); if(!t) return; t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, 2400); }
 
   async function loadMe(session){
     const u = session.user;
@@ -259,7 +260,7 @@
     try{ localStorage.setItem("stallboken-name", name); }catch(_){}
     ["fWho","nWho","cWho"].forEach(id => { const el = $(id); if(el) el.value = name; });
     $("meName").textContent = name;
-    $("inviteBtn").hidden = !me.is_admin;
+    $("adminBtn").hidden = !me.is_admin;
     show("app");
     resolveReady();
   }
@@ -348,6 +349,45 @@
       goIn(data.session);
     });
 
+    /* ---------- admin: logg ---------- */
+    const LOGPAGE = 150; let logRows = [], logArea = "", logDone = false;
+    async function loadLog(more){
+      let q = sb.from("activity_log").select("id,at,actor_name,area,summary").order("id", {ascending:false}).limit(LOGPAGE);
+      if(logArea) q = q.eq("area", logArea);
+      if(more && logRows.length) q = q.lt("id", logRows[logRows.length - 1].id);
+      const r = await q;
+      if(r.error){ $("log-list").innerHTML = '<p class="err">Kunde inte hämta loggen. Har du kört 03_logg.sql i Supabase?</p>'; return; }
+      logRows = more ? logRows.concat(r.data) : r.data;
+      logDone = r.data.length < LOGPAGE;
+      renderLog();
+    }
+    function renderLog(){
+      const q = $("log-search").value.trim().toLowerCase();
+      const rows = q ? logRows.filter(x => (x.actor_name + " " + x.summary).toLowerCase().includes(q)) : logRows;
+      $("log-more").hidden = logDone;
+      if(!rows.length){ $("log-list").innerHTML = '<p class="hint" style="padding:12px 0">' + (logRows.length ? "Inget matchar sökningen." : "Inget i loggen än.") + "</p>"; return; }
+      const today = new Date().toDateString(), yest = new Date(Date.now() - 864e5).toDateString();
+      let h = "", lastDay = "";
+      rows.forEach(x => {
+        const d = new Date(x.at), dk = d.toDateString();
+        if(dk !== lastDay){
+          lastDay = dk;
+          h += `<div class="logday">${dk === today ? "Idag" : dk === yest ? "Igår" : d.toLocaleDateString("sv-SE", {weekday:"long", day:"numeric", month:"long", year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined})}</div>`;
+        }
+        h += `<div class="logrow"><span class="lt">${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}</span><span class="lw">${esc(x.actor_name)}<span class="tag">${esc(x.area)}</span></span><span class="ls">${esc(x.summary)}</span></div>`;
+      });
+      $("log-list").innerHTML = h;
+    }
+    function openLog(){ logRows = []; $("log-search").value = ""; $("log-list").innerHTML = '<p class="hint">Hämtar…</p>'; loadLog(false); }
+    $("log-more").onclick = () => loadLog(true);
+    $("log-search").addEventListener("input", renderLog);
+    $("log-filter").addEventListener("click", e => {
+      const b = e.target.closest("button[data-area]"); if(!b) return;
+      logArea = b.dataset.area;
+      $("log-filter").querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+      logRows = []; $("log-list").innerHTML = '<p class="hint">Hämtar…</p>'; loadLog(false);
+    });
+
     /* logga ut */
     $("logoutBtn").onclick = async () => { loggingOut = true; await sb.auth.signOut().catch(()=>{}); location.replace(location.pathname); };
 
@@ -364,7 +404,7 @@
       $("sh-sms").href = "sms:?&body=" + encodeURIComponent(text);
       $("sh-share").hidden = !navigator.share;
       $("share").hidden = false;
-      $("share").scrollIntoView({block:"nearest"});
+      $("share").scrollIntoView({block:"nearest", behavior:"smooth"});
     }
     $("sh-copy").onclick = async () => {
       const t = $("sh-text");
@@ -375,44 +415,95 @@
     $("sh-share").onclick = () => { navigator.share({text: $("sh-text").value}).catch(()=>{}); };
     $("sh-done").onclick = () => { $("share").hidden = true; };
 
+    /* ---------- admin-sidan ---------- */
+    const admErr = msg => { $("adm-err").textContent = msg || ""; $("adm-err").hidden = !msg; };
+    let admTab = "riders";
+    function admShowTab(t){
+      admTab = t;
+      $("adm-tabs").querySelectorAll("button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.at === t)));
+      ["riders","invites","log"].forEach(x => $("at-" + x).hidden = x !== t);
+      admErr("");
+      if(t === "riders") loadMembers();
+      if(t === "invites") loadPending();
+      if(t === "log") openLog();
+    }
+    $("adm-tabs").addEventListener("click", e => { const b = e.target.closest("button[data-at]"); if(b) admShowTab(b.dataset.at); });
+    $("adminBtn").onclick = () => { $("share").hidden = true; $("adminPage").hidden = false; document.body.classList.add("admin-open"); $("adminPage").scrollTop = 0; admShowTab("riders"); };
+    $("adm-back").onclick = () => { $("adminPage").hidden = true; document.body.classList.remove("admin-open"); };
+    document.addEventListener("keydown", e => { if(e.key === "Escape" && !$("adminPage").hidden && !document.querySelector("dialog[open]")) $("adm-back").click(); });
+
     async function loadMembers(){
-      const [pr, iv] = await Promise.all([
-        sb.from("profiles").select("id,name,email,is_admin,created_at").order("created_at"),
-        sb.from("invites").select("code,kind,name,expires_at,target_user").is("used_at", null).gt("expires_at", new Date().toISOString()).order("created_at")
-      ]);
-      const list = $("inv-list");
-      if(pr.error){ list.innerHTML = '<li>Kunde inte hämta listan.</li>'; return; }
-      list.innerHTML = pr.data.map(p => `<li><span class="n"><b>${esc(p.name || "(inget namn)")}</b><span>${esc(p.email || "")}${p.is_admin ? " · admin" : ""}</span></span>
-        <span class="acts"><button class="btn small" type="button" data-reset="${p.id}" data-name="${esc(p.name)}">Nytt lösenord</button>${p.id === me.id || p.is_admin ? "" : `<button class="btn small" type="button" data-rm="${p.id}">Ta bort</button>`}</span></li>`).join("");
-      const pend = (iv.data || []).filter(i => i.kind === "invite");
-      $("inv-pending").innerHTML = pend.length ? pend.map(i => `<li><span class="n"><b>${esc(i.name || "Inbjudan")}</b><span>Ej använd · gäller till ${new Date(i.expires_at).toLocaleDateString("sv-SE")}</span></span>
+      const pr = await sb.from("profiles").select("id,name,email,is_admin,created_at").order("created_at");
+      const list = $("adm-members");
+      if(pr.error){ list.innerHTML = '<li class="hint">Kunde inte hämta listan.</li>'; return; }
+      const admins = pr.data.filter(p => p.is_admin).length;
+      $("adm-count").textContent = `${pr.data.length} personer · ${admins} admin`;
+      list.innerHTML = pr.data.map(p => {
+        const isMe = p.id === me.id, lastAdmin = p.is_admin && admins <= 1;
+        const nm = p.name || (p.email || "").split("@")[0] || "?";
+        return `<li class="member${p.is_admin ? " isadmin" : ""}">
+          <span class="av" aria-hidden="true">${esc(nm.charAt(0).toUpperCase())}</span>
+          <span class="who"><b>${esc(nm)}${isMe ? '<span class="you">du</span>' : ""}</b><span>${esc(p.email || "")} · med sedan ${new Date(p.created_at).toLocaleDateString("sv-SE")}</span></span>
+          <span class="seg" role="radiogroup" aria-label="Roll för ${esc(nm)}">
+            <button type="button" role="radio" data-role="0" data-id="${p.id}" aria-checked="${!p.is_admin}" ${lastAdmin ? 'disabled title="Det måste finnas minst en admin"' : ""}>Ryttare</button>
+            <button type="button" role="radio" data-role="1" data-id="${p.id}" aria-checked="${p.is_admin}">Admin</button>
+          </span>
+          <span class="acts">
+            <button class="btn small" type="button" data-reset="${p.id}" data-name="${esc(nm)}">Nytt lösenord</button>
+            ${isMe ? "" : `<button class="btn small" type="button" data-rm="${p.id}" data-admin="${p.is_admin ? 1 : 0}">Ta bort</button>`}
+          </span></li>`;
+      }).join("");
+    }
+    async function loadPending(){
+      const iv = await sb.from("invites").select("code,kind,name,is_admin,expires_at").is("used_at", null).eq("kind", "invite").gt("expires_at", new Date().toISOString()).order("created_at");
+      const pend = iv.data || [];
+      $("inv-pending").innerHTML = pend.length ? pend.map(i => `<li><span class="n"><b>${esc(i.name || "Inbjudan")}</b><span>${i.is_admin ? "Admin" : "Ryttare"} · ej använd · gäller till ${new Date(i.expires_at).toLocaleDateString("sv-SE")}</span></span>
         <span class="acts"><button class="btn small" type="button" data-show="${i.code}" data-name="${esc(i.name)}">Visa länk</button><button class="btn small" type="button" data-drop="${i.code}">Ta bort</button></span></li>`).join("")
         : '<li class="muted">Inga obesvarade inbjudningar.</li>';
     }
-    $("inviteBtn").onclick = () => { $("inv-err").hidden = true; $("share").hidden = true; $("inv-name").value = ""; loadMembers(); $("inviteDlg").showModal(); };
-    $("inv-close").onclick = () => $("inviteDlg").close();
-    $("inv-form").addEventListener("submit", async e => {
-      e.preventDefault(); $("inv-err").hidden = true;
-      const name = $("inv-name").value.trim(); const btn = $("inv-btn"); busy(btn, true, "Skapar…");
-      const r = await sb.rpc("create_invite", {p_name: name});
-      busy(btn, false, "Skapa inbjudningslänk");
-      if(r.error){ $("inv-err").textContent = "Det gick inte att skapa länken. Försök igen."; $("inv-err").hidden = false; return; }
-      $("inv-name").value = ""; showShare(r.data, "invite", name); loadMembers();
+
+    /* roll vid inbjudan */
+    let invAdmin = false;
+    $("inv-role").addEventListener("click", e => {
+      const b = e.target.closest("button[data-admin]"); if(!b) return;
+      invAdmin = b.dataset.admin === "1";
+      $("inv-role").querySelectorAll("button").forEach(x => x.setAttribute("aria-checked", String(x === b)));
     });
-    $("inviteDlg").addEventListener("click", async e => {
-      const b = e.target.closest("button[data-reset],button[data-rm],button[data-show],button[data-drop]"); if(!b) return;
-      $("inv-err").hidden = true;
-      const fail = msg => { $("inv-err").textContent = msg; $("inv-err").hidden = false; b.disabled = false; };
+    $("inv-form").addEventListener("submit", async e => {
+      e.preventDefault(); admErr("");
+      const name = $("inv-name").value.trim(); const btn = $("inv-btn"); busy(btn, true, "Skapar…");
+      const r = await sb.rpc("create_invite", {p_name: name, p_admin: invAdmin});
+      busy(btn, false, "Skapa inbjudningslänk");
+      if(r.error) return admErr(/function|schema cache/i.test(r.error.message) ? "Kör 04_roller.sql i Supabase först." : "Det gick inte att skapa länken. Försök igen.");
+      $("inv-name").value = ""; showShare(r.data, "invite", name); loadPending();
+    });
+
+    /* klick på admin-sidan */
+    $("adminPage").addEventListener("click", async e => {
+      const b = e.target.closest("button[data-role],button[data-reset],button[data-rm],button[data-show],button[data-drop]"); if(!b) return;
+      admErr("");
+      const fail = msg => { admErr(msg); b.disabled = false; };
+      if(b.dataset.role !== undefined){
+        if(b.getAttribute("aria-checked") === "true") return;
+        const toAdmin = b.dataset.role === "1";
+        if(b.dataset.id === me.id && !toAdmin && b.dataset.sure !== "1"){ b.dataset.sure = "1"; b.textContent = "Säker? Du förlorar admin"; return; }
+        b.disabled = true;
+        const r = await sb.rpc("set_member_role", {p_user: b.dataset.id, p_admin: toAdmin});
+        if(r.error) return fail(/minst en admin/i.test(r.error.message) ? "Det måste finnas minst en admin." : /function|schema cache/i.test(r.error.message) ? "Kör 04_roller.sql i Supabase först." : "Det gick inte att ändra rollen.");
+        toast(toAdmin ? "Personen är nu admin" : "Personen är nu ryttare");
+        if(b.dataset.id === me.id && !toAdmin){ location.reload(); return; }
+        loadMembers(); return;
+      }
       if(b.dataset.show){ showShare(b.dataset.show, "invite", b.dataset.name); return; }
       if(b.dataset.reset){
         b.disabled = true; const r = await sb.rpc("create_reset", {p_user: b.dataset.reset}); b.disabled = false;
         if(r.error) return fail("Det gick inte att skapa länken."); showShare(r.data, "reset", b.dataset.name); return;
       }
+      if(b.dataset.rm && b.dataset.admin === "1") return admErr("Gör personen till ryttare först, sedan kan du ta bort hen.");
       if(b.dataset.sure !== "1"){ b.dataset.sure = "1"; b.textContent = "Säker? Tryck igen"; b.classList.add("danger"); return; }
       b.disabled = true;
-      if(b.dataset.rm){ const r = await sb.rpc("remove_member", {p_user: b.dataset.rm}); if(r.error) return fail("Det gick inte att ta bort personen."); }
-      if(b.dataset.drop){ const r = await sb.from("invites").delete().eq("code", b.dataset.drop); if(r.error) return fail("Det gick inte att ta bort inbjudan."); }
-      loadMembers();
+      if(b.dataset.rm){ const r = await sb.rpc("remove_member", {p_user: b.dataset.rm}); if(r.error) return fail("Det gick inte att ta bort personen."); toast("Personen är borttagen"); loadMembers(); }
+      if(b.dataset.drop){ const r = await sb.from("invites").delete().eq("code", b.dataset.drop); if(r.error) return fail("Det gick inte att ta bort inbjudan."); loadPending(); }
     });
   });
 })();
@@ -770,7 +861,7 @@ dialog{border-radius:12px;border:2px solid var(--rope);box-shadow:6px 6px 0 rgba
     </div>
     <div class="hactions">
       <span class="mebar"><span class="lbl">Inloggad som</span> <b id="meName"></b></span>
-      <button class="btn" id="inviteBtn" type="button" hidden>Bjud in</button>
+      <button class="btn" id="adminBtn" type="button" hidden>Admin</button>
       <button class="btn" id="logoutBtn" type="button">Logga ut</button>
       <button class="btn" id="manageBtn" type="button"><span class="long">Lägg till / ta bort hästar</span><span class="short">Hästar</span></button>
       <button class="btn primary" id="newBtn" type="button">+ Ny bokning</button>
@@ -1431,12 +1522,49 @@ body:not(.authed) .wrap{display:none}
 .mebar{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted)}
 .mebar b{color:var(--fg)}
 body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
-/* admin-dialogen */
-#inviteDlg .sheet{gap:14px}
-#inviteDlg{width:min(520px,calc(100vw - 32px))}
+/* admin-sidan */
+#adminPage{position:fixed;inset:0;z-index:40;overflow-y:auto;background-color:var(--bg);
+  background-image:radial-gradient(rgba(125,93,64,.07) 1px,transparent 1.2px);background-size:22px 22px;
+  padding:calc(20px + env(safe-area-inset-top,0px)) 16px calc(40px + env(safe-area-inset-bottom,0px))}
+body.admin-open{overflow:hidden}
+.adm-wrap{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.adm-top{display:flex;align-items:center;gap:14px;border-bottom:4px double var(--leather);padding-bottom:14px}
+.adm-top h2{font-family:var(--wood);font-weight:400;color:var(--leather);font-size:clamp(24px,5vw,32px);margin:0}
+.adm-lead{margin:-6px 0 0}
+.adm-tabs{align-self:flex-start}
+.adm-card{background:var(--surface);border:1.5px solid var(--rope);border-radius:10px;box-shadow:var(--shadow);outline:1.5px dashed var(--rope);outline-offset:-7px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.adm-panel{display:flex;flex-direction:column;gap:16px}
+.adm-panel[hidden]{display:none!important}
+.adm-card h3{font-family:var(--display);font-weight:700;font-size:18px;margin:0;color:var(--leather)}
+.adm-cardhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.members{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.member{display:grid;grid-template-columns:42px minmax(0,1fr) auto auto;align-items:center;gap:6px 12px;padding:10px 12px;background:var(--surface-2);border-radius:8px}
+.member .av{width:42px;height:42px;border-radius:50%;background:var(--pine);color:var(--pine-ink);display:grid;place-items:center;font-family:var(--wood);font-size:18px}
+.member.isadmin .av{background:var(--leather)}
+.member .who{min-width:0}
+.member .who b{display:block;overflow-wrap:anywhere}
+.member .who span{display:block;font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.member .who .you{display:inline;font-size:11px;font-weight:700;color:var(--pine);text-transform:uppercase;letter-spacing:.05em;margin-left:6px}
+.member .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.seg{display:inline-flex;border:1.5px solid var(--rope);border-radius:8px;overflow:hidden;background:var(--surface)}
+.seg button{border:none;background:none;padding:7px 13px;font-weight:700;font-size:13px;color:var(--muted)}
+.seg button+button{border-left:1.5px solid var(--rope)}
+.seg button[aria-checked="true"]{background:var(--leather);color:var(--pine-ink)}
+.seg button:disabled{cursor:not-allowed;opacity:.6}
+.inv-new .seg{align-self:flex-start}
+.flabel{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--leather)}
+@media (max-width:640px){
+  .member{grid-template-columns:42px minmax(0,1fr)}
+  .member .seg,.member .acts{grid-column:1/-1}
+  .member .seg{justify-self:start}
+  .member .acts{justify-content:flex-start}
+  .adm-card{padding:16px}
+  .adm-tabs{align-self:stretch}
+  .adm-tabs button{flex:1}
+}
 .inv-new{display:flex;gap:10px;align-items:end;flex-wrap:wrap}
 .inv-new .field{flex:1 1 200px}
-.share{background:var(--pin-bg);border:1.5px solid var(--pin-line);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px}
+.share{box-shadow:var(--shadow);background:var(--pin-bg);border:1.5px solid var(--pin-line);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px}
 .share textarea{width:100%;resize:none;border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--surface);font-size:14px;line-height:1.4}
 .share-acts{display:flex;gap:8px;flex-wrap:wrap}
 .share-acts a.btn{text-decoration:none;display:inline-flex;align-items:center;color:var(--fg)}
@@ -1448,6 +1576,17 @@ body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
 .inv-ul .n b{display:block}
 .inv-ul .n span{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
 .inv-ul .acts{display:flex;gap:6px;flex-wrap:wrap}
+.logfilter{display:flex;gap:6px;flex-wrap:wrap}
+.logfilter button{border:1.5px solid var(--rope);background:var(--surface);border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--muted)}
+.logfilter button[aria-pressed="true"]{background:var(--leather);border-color:var(--leather);color:var(--pine-ink)}
+.logsearch{width:100%;border:1.5px solid var(--line);border-radius:6px;padding:10px 12px;background:var(--surface);font-size:15px}
+.loglist{display:flex;flex-direction:column;border-top:1px solid var(--line)}
+.logday{font-family:var(--display);font-weight:700;font-size:13px;color:var(--leather);padding:12px 0 4px;position:sticky;top:0;background:var(--surface)}
+.logrow{display:grid;grid-template-columns:44px 1fr;gap:2px 10px;padding:8px 0;border-bottom:1px dashed var(--line)}
+.logrow .lt{font-family:var(--mono);font-size:12px;color:var(--muted);padding-top:2px;font-variant-numeric:tabular-nums}
+.logrow .lw{font-weight:700;font-size:13.5px}
+.logrow .lw .tag{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--pine);margin-left:6px}
+.logrow .ls{grid-column:2;font-size:14px;overflow-wrap:anywhere}
 @media (max-width:640px){
   body.authed header.top{flex-wrap:wrap;gap:10px;padding-bottom:12px}
   body.authed .brand{flex:1 1 100%}
@@ -1507,15 +1646,20 @@ body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
   </div>
 </div>
 
-<dialog id="inviteDlg">
-  <div class="sheet">
-    <h3>Ryttare i Stallboken</h3>
+<section id="adminPage" hidden aria-labelledby="adm-title">
+  <div class="adm-wrap">
+    <div class="adm-top">
+      <button class="btn" type="button" id="adm-back">← Tillbaka</button>
+      <h2 id="adm-title">★ Admin</h2>
+    </div>
+    <p class="hint adm-lead">Bara admin ser den här sidan.</p>
 
-    <form id="inv-form" class="inv-new">
-      <div class="field"><label for="inv-name">Bjud in någon ny · namn (valfritt)</label><input id="inv-name" maxlength="40" placeholder="t.ex. Maja"></div>
-      <button class="btn primary" type="submit" id="inv-btn">Skapa inbjudningslänk</button>
-    </form>
-
+    <div class="tabs adm-tabs" role="tablist" id="adm-tabs">
+      <button type="button" role="tab" data-at="riders" aria-selected="true">Ryttare</button>
+      <button type="button" role="tab" data-at="invites" aria-selected="false">Inbjudningar</button>
+      <button type="button" role="tab" data-at="log" aria-selected="false">Logg</button>
+    </div>
+    <p class="err" id="adm-err" hidden></p>
     <div class="share" id="share" hidden>
       <b id="sh-title"></b>
       <label class="sr" for="sh-text">Text att skicka</label>
@@ -1528,16 +1672,56 @@ body.authed .field:has(#fWho),body.authed .nrow .field:has(#nWho){display:none}
       </div>
     </div>
 
-    <p class="err" id="inv-err" hidden></p>
+    <!-- Ryttare -->
+    <div class="adm-panel" id="at-riders">
+      <div class="adm-card">
+        <div class="adm-cardhead"><h3>Med i stallboken</h3><span class="hint" id="adm-count"></span></div>
+        <p class="hint" style="margin:0"><b>Admin</b> kan bjuda in, ändra roller, ta bort ryttare och se loggen. <b>Ryttare</b> kan boka, bocka av, skriva och chatta.</p>
+        <ul class="members" id="adm-members"><li class="hint">Hämtar…</li></ul>
+      </div>
+    </div>
 
-    <h4 class="inv-h">Med i stallboken</h4>
-    <ul id="inv-list" class="inv-ul"><li>Hämtar…</li></ul>
-    <h4 class="inv-h">Väntar på att registrera sig</h4>
-    <ul id="inv-pending" class="inv-ul"></ul>
+    <!-- Inbjudningar -->
+    <div class="adm-panel" id="at-invites" hidden>
+      <div class="adm-card">
+        <h3>Bjud in någon ny</h3>
+        <form id="inv-form" class="inv-new">
+          <div class="field"><label for="inv-name">Namn (valfritt)</label><input id="inv-name" maxlength="40" placeholder="t.ex. Maja"></div>
+          <div class="field"><span class="flabel">Roll</span>
+            <div class="seg" role="radiogroup" aria-label="Roll för den inbjudna" id="inv-role">
+              <button type="button" role="radio" data-admin="0" aria-checked="true">Ryttare</button>
+              <button type="button" role="radio" data-admin="1" aria-checked="false">Admin</button>
+            </div>
+          </div>
+          <button class="btn primary" type="submit" id="inv-btn">Skapa inbjudningslänk</button>
+        </form>
+      </div>
+      <div class="adm-card">
+        <h3>Väntar på att registrera sig</h3>
+        <ul class="inv-ul" id="inv-pending"><li class="muted">Hämtar…</li></ul>
+      </div>
+    </div>
 
-    <div class="actions"><button class="btn" type="button" id="inv-close">Stäng</button></div>
+    <!-- Logg -->
+    <div class="adm-panel" id="at-log" hidden>
+      <div class="adm-card">
+        <div class="logfilter" id="log-filter" role="group" aria-label="Visa">
+          <button type="button" data-area="" aria-pressed="true">Allt</button>
+          <button type="button" data-area="Bokning" aria-pressed="false">Bokningar</button>
+          <button type="button" data-area="Sysslor" aria-pressed="false">Sysslor</button>
+          <button type="button" data-area="Häst" aria-pressed="false">Hästar</button>
+          <button type="button" data-area="Anteckning" aria-pressed="false">Anteckningar</button>
+          <button type="button" data-area="Chatt" aria-pressed="false">Chatt</button>
+          <button type="button" data-area="Ryttare" aria-pressed="false">Ryttare</button>
+        </div>
+        <label class="sr" for="log-search">Sök i loggen</label>
+        <input id="log-search" class="logsearch" type="search" placeholder="Sök på namn, häst eller text…">
+        <div class="loglist" id="log-list"><p class="hint">Hämtar…</p></div>
+        <button class="btn" type="button" id="log-more" hidden>Visa äldre</button>
+      </div>
+    </div>
   </div>
-</dialog>
+</section>
 
 </body>
 </html>
