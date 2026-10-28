@@ -913,7 +913,6 @@
     chip.setAttribute("aria-label", `Vädret i Eggebyberg: ${deg(c.temperature_2m)}, ${TEXT(c.weather_code).toLowerCase()}. Visa mer`);
     pop.innerHTML = `
       <div class="wp-head">${icon(c.weather_code, c.is_day, 40)}<div><b>${deg(c.temperature_2m)} ${TEXT(c.weather_code).toLowerCase()}</b><span>${PLACE}</span></div></div>
-      <p class="wp-quip">${quip(c)}</p>
       <dl class="wp-list">
         <dt>Känns som</dt><dd>${deg(c.apparent_temperature)}</dd>
         <dt>Vind</dt><dd>${Math.round(c.wind_speed_10m)} m/s${c.wind_gusts_10m >= c.wind_speed_10m + 3 ? ` (byar ${Math.round(c.wind_gusts_10m)})` : ""}</dd>
